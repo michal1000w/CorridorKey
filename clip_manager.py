@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import argparse
 import glob
 import logging
 import os
@@ -17,7 +18,6 @@ import numpy as np
 from device_utils import resolve_device
 
 if TYPE_CHECKING:
-    from CorridorKeyModule.inference_engine import CorridorKeyEngine
     from gvm_core import GVMProcessor
 
 logger = logging.getLogger(__name__)
@@ -185,31 +185,7 @@ def get_gvm_processor(device: str = "cpu") -> GVMProcessor:
         raise RuntimeError(f"Failed to initialize GVM Processor: {e}") from e
 
 
-def get_corridor_key_engine(device: str = "cpu") -> CorridorKeyEngine:
-    try:
-        from CorridorKeyModule.inference_engine import CorridorKeyEngine
-
-        # Auto-detect checkpoint
-        ckpt_dir = os.path.join(BASE_DIR, "CorridorKeyModule/checkpoints")
-        ckpt_files = glob.glob(os.path.join(ckpt_dir, "*.pth"))
-
-        if len(ckpt_files) == 0:
-            raise FileNotFoundError(f"No .pth checkpoint found in {ckpt_dir}")
-        elif len(ckpt_files) > 1:
-            raise ValueError(
-                f"Multiple checkpoints found in {ckpt_dir}. "
-                f"Please ensure only one exists: {[os.path.basename(f) for f in ckpt_files]}"
-            )
-
-        ckpt_path = ckpt_files[0]
-        logger.info(f"Using checkpoint: {os.path.basename(ckpt_path)}")
-
-        return CorridorKeyEngine(checkpoint_path=ckpt_path, device=device, img_size=2048)
-    except Exception as e:
-        raise RuntimeError(f"Failed to initialize CorridorKey Engine: {e}") from e
-
-
-def generate_alphas(clips: list[ClipEntry], device: str | None = None) -> None:
+def generate_alphas(clips, device=None):
     clips_to_process = [c for c in clips if c.alpha_asset is None]
 
     if not clips_to_process:
@@ -402,8 +378,6 @@ def run_videomama(clips: list[ClipEntry], chunk_size: int = 50, device: str | No
                     img = cv2.imread(fpath)
 
                 if img is not None:
-                    if len(input_frames) == 0:
-                        logger.info(f"Debug Input Frame 0 stats: Min={img.min()}, Max={img.max()}, Mean={img.mean()}")
                     input_frames.append(cv2.cvtColor(img, cv2.COLOR_BGR2RGB))
 
         # 2. Mask Frames
@@ -447,10 +421,6 @@ def run_videomama(clips: list[ClipEntry], chunk_size: int = 50, device: str | No
                 _, m = cv2.threshold(m, 10, 255, cv2.THRESH_BINARY)
                 mask_frames.append(m)
             cap.release()
-
-        if mask_frames:
-            m0 = mask_frames[0]
-            logger.info(f"Debug Mask Frame 0 stats (Thresholded): Min={m0.min()}, Max={m0.max()}, Mean={m0.mean()}")
 
         # Validate Lengths
         num_frames = min(len(input_frames), len(mask_frames))
@@ -503,12 +473,6 @@ def run_videomama(clips: list[ClipEntry], chunk_size: int = 50, device: str | No
                     if total_saved >= len(in_names):
                         break
 
-                    if total_saved == 0:
-                        logger.info(
-                            f"Debug Output Frame 0 stats: Min={frame.min()}, Max={frame.max()}, "
-                            f"Mean={frame.mean()}, Shape={frame.shape}, Dtype={frame.dtype}"
-                        )
-
                     name = in_names[total_saved]
                     out_path = os.path.join(alpha_output_dir, f"{name}.png")
 
@@ -530,7 +494,7 @@ def run_videomama(clips: list[ClipEntry], chunk_size: int = 50, device: str | No
             traceback.print_exc()
 
 
-def run_inference(clips: list[ClipEntry], device: str | None = None) -> None:
+def run_inference(clips, device=None, backend=None, max_frames=None):
     ready_clips = [c for c in clips if c.input_asset and c.alpha_asset]
 
     if not ready_clips:
@@ -599,7 +563,9 @@ def run_inference(clips: list[ClipEntry], device: str | None = None) -> None:
 
     if device is None:
         device = resolve_device()
-    engine = get_corridor_key_engine(device=device)
+    from CorridorKeyModule.backend import create_engine
+
+    engine = create_engine(backend=backend, device=device)
 
     for clip in ready_clips:
         logger.info(f"Running Inference on: {clip.name}")
@@ -615,6 +581,8 @@ def run_inference(clips: list[ClipEntry], device: str | None = None) -> None:
             os.makedirs(d, exist_ok=True)
 
         num_frames = min(clip.input_asset.frame_count, clip.alpha_asset.frame_count)
+        if max_frames is not None:
+            num_frames = min(num_frames, max_frames)
         logger.info(
             f"  Input frames: {clip.input_asset.frame_count},"
             f" Alpha frames: {clip.alpha_asset.frame_count} -> Processing {num_frames} frames"
@@ -913,3 +881,46 @@ def scan_clips() -> list[ClipEntry]:
         print("\nAll clip folders appear valid.\n")
 
     return valid_clips
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="CorridorKey Clip Manager")
+    parser.add_argument("--action", choices=["generate_alphas", "run_inference", "list", "wizard"], required=True)
+    parser.add_argument("--win_path", help=r"Windows Path (example: V:\...) for Wizard Mode", default=None)
+    parser.add_argument(
+        "--device",
+        choices=["auto", "cuda", "mps", "cpu"],
+        default="auto",
+        help="Compute device (default: auto-detect CUDA > MPS > CPU)",
+    )
+    parser.add_argument(
+        "--backend",
+        choices=["auto", "torch", "mlx"],
+        default="auto",
+        help="Inference backend (default: auto-detect MLX on Apple Silicon, else Torch)",
+    )
+    parser.add_argument(
+        "--max-frames",
+        type=int,
+        default=None,
+        help="Limit number of frames to process per clip (e.g. 1 for first frame only)",
+    )
+
+    args = parser.parse_args()
+
+    device = resolve_device(args.device)
+    logger.info(f"Using device: {device}")
+
+    if args.action == "list":
+        scan_clips()
+    elif args.action == "generate_alphas":
+        clips = scan_clips()
+        generate_alphas(clips, device=device)
+    elif args.action == "run_inference":
+        clips = scan_clips()
+        run_inference(clips, device=device, backend=args.backend, max_frames=args.max_frames)
+    elif args.action == "wizard":
+        if not args.win_path:
+            print("Error: --win_path required for wizard.")
+        else:
+            raise NotImplementedError("interactive_wizard is not yet implemented")

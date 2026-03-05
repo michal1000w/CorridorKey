@@ -7,9 +7,7 @@ import torch.nn.functional as F
 
 
 class MLP(nn.Module):
-    """
-    Linear Embedding: C_in -> C_out
-    """
+    """Linear embedding: C_in -> C_out."""
 
     def __init__(self, input_dim: int = 2048, embed_dim: int = 768) -> None:
         super().__init__()

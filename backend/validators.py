@@ -7,7 +7,6 @@ from __future__ import annotations
 
 import logging
 import os
-from typing import Optional
 
 import numpy as np
 
@@ -95,7 +94,7 @@ def normalize_mask_dtype(mask: np.ndarray) -> np.ndarray:
 
 
 def validate_frame_read(
-    frame: Optional[np.ndarray],
+    frame: np.ndarray | None,
     clip_name: str,
     frame_index: int,
     path: str,

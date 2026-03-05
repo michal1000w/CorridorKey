@@ -11,7 +11,7 @@ _load_frames_for_videomama, _load_mask_frames_for_videomama).
 
 from __future__ import annotations
 
-from typing import Callable, Optional
+from typing import Callable
 
 import cv2
 import numpy as np
@@ -27,7 +27,7 @@ EXR_WRITE_FLAGS = [
 ]
 
 
-def read_image_frame(fpath: str, gamma_correct_exr: bool = False) -> Optional[np.ndarray]:
+def read_image_frame(fpath: str, gamma_correct_exr: bool = False) -> np.ndarray | None:
     """Read an image file (EXR or standard) as float32 RGB [0, 1].
 
     Args:
@@ -63,7 +63,7 @@ def read_image_frame(fpath: str, gamma_correct_exr: bool = False) -> Optional[np
 def read_video_frame_at(
     video_path: str,
     frame_index: int,
-) -> Optional[np.ndarray]:
+) -> np.ndarray | None:
     """Read a single frame from a video by index, as float32 RGB [0, 1].
 
     Args:
@@ -86,7 +86,7 @@ def read_video_frame_at(
 
 def read_video_frames(
     video_path: str,
-    processor: Optional[Callable[[np.ndarray], np.ndarray]] = None,
+    processor: Callable[[np.ndarray], np.ndarray] | None = None,
 ) -> list[np.ndarray]:
     """Read all frames from a video, optionally applying a processor to each.
 
@@ -117,7 +117,7 @@ def read_video_frames(
     return frames
 
 
-def read_mask_frame(fpath: str, clip_name: str = "", frame_index: int = 0) -> Optional[np.ndarray]:
+def read_mask_frame(fpath: str, clip_name: str = "", frame_index: int = 0) -> np.ndarray | None:
     """Read a mask frame as float32 [H, W] in [0, 1].
 
     Handles any channel count and dtype via normalize_mask_channels/dtype.
@@ -144,7 +144,7 @@ def read_mask_frame(fpath: str, clip_name: str = "", frame_index: int = 0) -> Op
 def read_video_mask_at(
     video_path: str,
     frame_index: int,
-) -> Optional[np.ndarray]:
+) -> np.ndarray | None:
     """Read a single mask frame from a video by index, as float32 [H, W] [0, 1].
 
     Extracts the blue channel (index 2) from BGR, matching the convention

@@ -17,7 +17,7 @@ import re
 import shutil
 import subprocess
 import threading
-from typing import Callable, Optional
+from typing import Callable
 
 logger = logging.getLogger(__name__)
 
@@ -134,8 +134,8 @@ def extract_frames(
     video_path: str,
     out_dir: str,
     pattern: str = "frame_%06d.png",
-    on_progress: Optional[Callable[[int, int], None]] = None,
-    cancel_event: Optional[threading.Event] = None,
+    on_progress: Callable[[int, int], None] | None = None,
+    cancel_event: threading.Event | None = None,
     total_frames: int = 0,
 ) -> int:
     """Extract video frames to PNG image sequence.
@@ -295,8 +295,8 @@ def stitch_video(
     pattern: str = "frame_%06d.png",
     codec: str = "libx264",
     crf: int = 18,
-    on_progress: Optional[Callable[[int, int], None]] = None,
-    cancel_event: Optional[threading.Event] = None,
+    on_progress: Callable[[int, int], None] | None = None,
+    cancel_event: threading.Event | None = None,
 ) -> None:
     """Stitch image sequence back into a video file.
 

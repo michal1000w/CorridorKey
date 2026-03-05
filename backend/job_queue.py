@@ -23,7 +23,7 @@ import uuid
 from collections import deque
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Any, Callable, Optional
+from typing import Any, Callable
 
 from .errors import JobCancelledError
 
@@ -57,7 +57,7 @@ class GPUJob:
     params: dict[str, Any] = field(default_factory=dict)
     status: JobStatus = JobStatus.QUEUED
     _cancel_requested: bool = field(default=False, repr=False)
-    error_message: Optional[str] = None
+    error_message: str | None = None
 
     # Progress tracking
     current_frame: int = 0
@@ -111,14 +111,14 @@ class GPUJobQueue:
     def __init__(self):
         self._queue: deque[GPUJob] = deque()
         self._lock = threading.Lock()
-        self._current_job: Optional[GPUJob] = None
+        self._current_job: GPUJob | None = None
         self._history: list[GPUJob] = []  # completed/cancelled/failed jobs for UI display
 
         # Callbacks (set by UI or CLI)
-        self.on_progress: Optional[ProgressCallback] = None
-        self.on_warning: Optional[WarningCallback] = None
-        self.on_completion: Optional[CompletionCallback] = None
-        self.on_error: Optional[ErrorCallback] = None
+        self.on_progress: ProgressCallback | None = None
+        self.on_warning: WarningCallback | None = None
+        self.on_completion: CompletionCallback | None = None
+        self.on_error: ErrorCallback | None = None
 
     def submit(self, job: GPUJob) -> bool:
         """Add a job to the queue. Returns False if duplicate detected.
@@ -160,7 +160,7 @@ class GPUJobQueue:
             logger.info(f"Job queued [{job.id}]: {job.job_type.value} for '{job.clip_name}'")
             return True
 
-    def next_job(self) -> Optional[GPUJob]:
+    def next_job(self) -> GPUJob | None:
         """Get the next pending job without starting it. Returns None if empty."""
         with self._lock:
             if self._queue:
@@ -262,7 +262,7 @@ class GPUJobQueue:
         if self.on_warning:
             self.on_warning(message)
 
-    def find_job_by_id(self, job_id: str) -> Optional[GPUJob]:
+    def find_job_by_id(self, job_id: str) -> GPUJob | None:
         """Find a job by ID in queue, current, or history."""
         with self._lock:
             if self._current_job and self._current_job.id == job_id:
@@ -291,7 +291,7 @@ class GPUJobQueue:
             return len(self._queue) > 0
 
     @property
-    def current_job(self) -> Optional[GPUJob]:
+    def current_job(self) -> GPUJob | None:
         with self._lock:
             return self._current_job
 

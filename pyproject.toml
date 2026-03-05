@@ -70,6 +70,7 @@ testpaths = ["tests"]
 markers = [
     "gpu: requires CUDA GPU (skipped in CI)",
     "slow: long-running test",
+    "mlx: requires Apple Silicon with MLX installed",
 ]
 addopts = "-x --tb=short"
 

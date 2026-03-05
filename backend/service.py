@@ -22,7 +22,7 @@ import threading
 import time
 from dataclasses import asdict, dataclass
 from enum import Enum
-from typing import Any, Callable, Optional
+from typing import Any, Callable
 
 import numpy as np
 
@@ -84,8 +84,6 @@ class InferenceParams:
     despill_strength: float = 1.0  # 0.0 to 1.0
     auto_despeckle: bool = True
     despeckle_size: int = 400
-    despeckle_dilation: int = 25  # clean_matte dilation radius
-    despeckle_blur: int = 5  # clean_matte blur kernel half-size
     refiner_scale: float = 1.0
 
     def to_dict(self) -> dict:
@@ -140,7 +138,7 @@ class FrameResult:
     frame_index: int
     input_stem: str
     success: bool
-    warning: Optional[str] = None
+    warning: str | None = None
 
 
 class CorridorKeyService:
@@ -162,7 +160,7 @@ class CorridorKeyService:
         self._videomama_pipeline = None
         self._active_model = _ActiveModel.NONE
         self._device: str = "cpu"
-        self._job_queue: Optional[GPUJobQueue] = None
+        self._job_queue: GPUJobQueue | None = None
         # GPU mutex — serializes ALL model operations (Codex: thread safety)
         self._gpu_lock = threading.Lock()
 
@@ -388,9 +386,9 @@ class CorridorKeyService:
         clip: ClipEntry,
         frame_index: int,
         input_files: list[str],
-        input_cap: Optional[Any],
+        input_cap: Any | None,
         input_is_linear: bool,
-    ) -> tuple[Optional[np.ndarray], str, bool]:
+    ) -> tuple[np.ndarray | None, str, bool]:
         """Read a single input frame.
 
         Returns:
@@ -417,8 +415,8 @@ class CorridorKeyService:
         clip: ClipEntry,
         frame_index: int,
         alpha_files: list[str],
-        alpha_cap: Optional[Any],
-    ) -> Optional[np.ndarray]:
+        alpha_cap: Any | None,
+    ) -> np.ndarray | None:
         """Read a single alpha/mask frame and normalize to [H, W] float32."""
         if alpha_cap:
             ret, frame = alpha_cap.read()
@@ -538,12 +536,12 @@ class CorridorKeyService:
         self,
         clip: ClipEntry,
         params: InferenceParams,
-        job: Optional[GPUJob] = None,
-        on_progress: Optional[Callable[[str, int, int], None]] = None,
-        on_warning: Optional[Callable[[str], None]] = None,
-        skip_stems: Optional[set[str]] = None,
-        output_config: Optional[OutputConfig] = None,
-        frame_range: Optional[tuple[int, int]] = None,
+        job: GPUJob | None = None,
+        on_progress: Callable[[str, int, int], None] | None = None,
+        on_warning: Callable[[str], None] | None = None,
+        skip_stems: set[str] | None = None,
+        output_config: OutputConfig | None = None,
+        frame_range: tuple[int, int] | None = None,
     ) -> list[FrameResult]:
         """Run CorridorKey inference on a single clip.
 
@@ -663,8 +661,6 @@ class CorridorKeyService:
                             despill_strength=params.despill_strength,
                             auto_despeckle=params.auto_despeckle,
                             despeckle_size=params.despeckle_size,
-                            despeckle_dilation=params.despeckle_dilation,
-                            despeckle_blur=params.despeckle_blur,
                             refiner_scale=params.refiner_scale,
                         )
                     logger.debug(f"Clip '{clip.name}' frame {i}: process_frame {time.monotonic() - t_frame:.3f}s")
@@ -735,8 +731,8 @@ class CorridorKeyService:
         clip: ClipEntry,
         params: InferenceParams,
         frame_index: int,
-        job: Optional[GPUJob] = None,
-    ) -> Optional[dict]:
+        job: GPUJob | None = None,
+    ) -> dict | None:
         """Reprocess a single frame with current params.
 
         Returns the result dict (fg, alpha, comp, processed) or None.
@@ -794,8 +790,6 @@ class CorridorKeyService:
                 despill_strength=params.despill_strength,
                 auto_despeckle=params.auto_despeckle,
                 despeckle_size=params.despeckle_size,
-                despeckle_dilation=params.despeckle_dilation,
-                despeckle_blur=params.despeckle_blur,
                 refiner_scale=params.refiner_scale,
             )
         logger.debug(f"Clip '{clip.name}' frame {frame_index}: reprocess {time.monotonic() - t_start:.3f}s")
@@ -806,9 +800,9 @@ class CorridorKeyService:
     def run_gvm(
         self,
         clip: ClipEntry,
-        job: Optional[GPUJob] = None,
-        on_progress: Optional[Callable[[str, int, int], None]] = None,
-        on_warning: Optional[Callable[[str], None]] = None,
+        job: GPUJob | None = None,
+        on_progress: Callable[[str, int, int], None] | None = None,
+        on_warning: Callable[[str], None] | None = None,
     ) -> None:
         """Run GVM auto alpha generation for a clip.
 
@@ -886,10 +880,10 @@ class CorridorKeyService:
     def run_videomama(
         self,
         clip: ClipEntry,
-        job: Optional[GPUJob] = None,
-        on_progress: Optional[Callable[[str, int, int], None]] = None,
-        on_warning: Optional[Callable[[str], None]] = None,
-        on_status: Optional[Callable[[str], None]] = None,
+        job: GPUJob | None = None,
+        on_progress: Callable[[str, int, int], None] | None = None,
+        on_warning: Callable[[str], None] | None = None,
+        on_status: Callable[[str], None] | None = None,
         chunk_size: int = 50,
     ) -> None:
         """Run VideoMaMa guided alpha generation for a clip.
@@ -1059,8 +1053,8 @@ class CorridorKeyService:
         self,
         asset: ClipAsset,
         clip_name: str,
-        job: Optional[GPUJob] = None,
-        on_status: Optional[Callable[[str], None]] = None,
+        job: GPUJob | None = None,
+        on_status: Callable[[str], None] | None = None,
     ) -> list[np.ndarray]:
         """Load input frames for VideoMaMa as uint8 RGB [0, 255].
 

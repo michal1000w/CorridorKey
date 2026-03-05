@@ -32,9 +32,9 @@ import logging
 import os
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Optional
 
 from .errors import ClipScanError, InvalidStateTransitionError
+from .natural_sort import natsorted
 from .project import is_image_file as _is_image_file
 from .project import is_video_file as _is_video_file
 
@@ -98,8 +98,6 @@ class ClipAsset:
         """
         if self.asset_type != "sequence" or not os.path.isdir(self.path):
             return []
-        from .natural_sort import natsorted
-
         return natsorted([f for f in os.listdir(self.path) if _is_image_file(f)])
 
 
@@ -132,12 +130,12 @@ class ClipEntry:
     name: str
     root_path: str
     state: ClipState = ClipState.RAW
-    input_asset: Optional[ClipAsset] = None
-    alpha_asset: Optional[ClipAsset] = None
-    mask_asset: Optional[ClipAsset] = None  # User-provided VideoMaMa mask
-    in_out_range: Optional[InOutRange] = None  # Per-clip in/out markers (None = full clip)
+    input_asset: ClipAsset | None = None
+    alpha_asset: ClipAsset | None = None
+    mask_asset: ClipAsset | None = None  # User-provided VideoMaMa mask
+    in_out_range: InOutRange | None = None  # Per-clip in/out markers (None = full clip)
     warnings: list[str] = field(default_factory=list)
-    error_message: Optional[str] = None
+    error_message: str | None = None
     extraction_progress: float = 0.0  # 0.0 to 1.0 during EXTRACTING
     extraction_total: int = 0  # total frames expected during extraction
     _processing: bool = field(default=False, repr=False)  # lock: watcher must not reclassify
@@ -232,7 +230,7 @@ class ClipEntry:
             result &= s
         return result
 
-    def _read_manifest(self) -> Optional[dict]:
+    def _read_manifest(self) -> dict | None:
         """Read the run manifest if it exists."""
         manifest_path = os.path.join(self.output_dir, ".corridorkey_manifest.json")
         if not os.path.isfile(manifest_path):
@@ -246,7 +244,7 @@ class ClipEntry:
             logger.debug(f"Failed to read manifest at {manifest_path}: {e}")
             return None
 
-    def _resolve_original_path(self) -> Optional[str]:
+    def _resolve_original_path(self) -> str | None:
         """Resolve the original video path from clip.json or project.json."""
         from .project import _read_clip_or_project_json
 
