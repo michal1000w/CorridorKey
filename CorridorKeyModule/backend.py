@@ -91,6 +91,19 @@ def _discover_checkpoint(ext: str) -> Path:
     matches = glob.glob(os.path.join(CHECKPOINT_DIR, f"*{ext}"))
 
     if len(matches) == 0:
+        logger.info(f"No {ext} checkpoint found in {CHECKPOINT_DIR}. Downloading from HuggingFace...")
+        try:
+            import huggingface_hub
+            huggingface_hub.snapshot_download(
+                repo_id="nikopueringer/CorridorKey_v1.0",
+                local_dir=CHECKPOINT_DIR,
+                allow_patterns=[f"*{ext}"]
+            )
+            matches = glob.glob(os.path.join(CHECKPOINT_DIR, f"*{ext}"))
+        except Exception as e:
+            logger.error(f"Failed to download {ext} checkpoints: {e}")
+
+    if len(matches) == 0:
         other_ext = MLX_EXT if ext == TORCH_EXT else TORCH_EXT
         other_files = glob.glob(os.path.join(CHECKPOINT_DIR, f"*{other_ext}"))
         hint = ""

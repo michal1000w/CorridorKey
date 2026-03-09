@@ -295,6 +295,21 @@ class CorridorKeyService:
         ckpt_files = glob_module.glob(os.path.join(ckpt_dir, "*.pth"))
 
         if len(ckpt_files) == 0:
+            logger.info(f"No checkpoint found in {ckpt_dir}. Downloading from HuggingFace...")
+            try:
+                import huggingface_hub
+                # The CorridorKey repo has a few checkpoints, we'll download all of them
+                # CorridorKey-v1.pth 
+                huggingface_hub.snapshot_download(
+                    repo_id="CorridorDigital/CorridorKey",
+                    local_dir=ckpt_dir,
+                    allow_patterns=["*.pth"]
+                )
+                ckpt_files = glob_module.glob(os.path.join(ckpt_dir, "*.pth"))
+            except Exception as e:
+                logger.error(f"Failed to download checkpoints: {e}")
+
+        if len(ckpt_files) == 0:
             raise FileNotFoundError(f"No .pth checkpoint found in {ckpt_dir}")
         elif len(ckpt_files) > 1:
             raise ValueError(
