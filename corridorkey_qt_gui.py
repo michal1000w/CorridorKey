@@ -254,6 +254,15 @@ def _rectangle_mask(shape: tuple[int, int], box: tuple[int, int, int, int]) -> n
     return mask
 
 
+def _merge_candidate_masks(candidates: list[SegmentationCandidate]) -> np.ndarray | None:
+    if not candidates:
+        return None
+    merged = np.zeros_like(candidates[0].mask, dtype=np.float32)
+    for candidate in candidates:
+        merged = np.maximum(merged, candidate.mask.astype(np.float32))
+    return merged
+
+
 def _coarse_hint_from_mask(mask: np.ndarray, blur_size: int, erode_size: int) -> np.ndarray:
     binary = (mask >= 0.5).astype(np.uint8) * 255
     if erode_size > 0:
@@ -278,9 +287,10 @@ def _create_tracker():
 def _overlay_candidates(
     frame_rgb: np.ndarray,
     candidates: list[SegmentationCandidate],
-    selected_index: int | None,
+    selected_indices: set[int] | None,
 ) -> np.ndarray:
     canvas = frame_rgb.copy()
+    selected_indices = selected_indices or set()
     for index, candidate in enumerate(candidates):
         color = np.array(_MASK_PALETTE[index % len(_MASK_PALETTE)], dtype=np.uint8)
         mask = candidate.mask >= 0.5
@@ -290,8 +300,9 @@ def _overlay_candidates(
             )
 
         x1, y1, x2, y2 = candidate.box
-        border_color = (50, 255, 120) if selected_index == index else tuple(int(v) for v in color.tolist())
-        thickness = 4 if selected_index == index else 2
+        is_selected = index in selected_indices
+        border_color = (50, 255, 120) if is_selected else tuple(int(v) for v in color.tolist())
+        thickness = 4 if is_selected else 2
         cv2.rectangle(canvas, (x1, y1), (x2, y2), border_color, thickness)
         label = f"{index + 1}. {candidate.label_name} {candidate.score:.2f}"
         cv2.putText(
@@ -426,7 +437,7 @@ class MediaReader:
 
 class DropPreviewLabel(QLabel):
     file_dropped = Signal(str)
-    image_clicked = Signal(int, int)
+    image_clicked = Signal(int, int, bool)
 
     def __init__(self, title: str):
         super().__init__()
@@ -486,7 +497,8 @@ class DropPreviewLabel(QLabel):
         scale_y = image_height / pixmap_rect.height()
         image_x = int((event.position().x() - pixmap_rect.x()) * scale_x)
         image_y = int((event.position().y() - pixmap_rect.y()) * scale_y)
-        self.image_clicked.emit(image_x, image_y)
+        shift_held = bool(event.modifiers() & Qt.ShiftModifier)
+        self.image_clicked.emit(image_x, image_y, shift_held)
         super().mousePressEvent(event)
 
     def _refresh_pixmap(self) -> None:
@@ -637,7 +649,7 @@ class GenerateMaskHintWorker(QThread):
         self,
         source_path: str,
         clip_root: str,
-        selection: SegmentationCandidate,
+        selections: list[SegmentationCandidate],
         manager: SegmentationModelManager,
         preferred_device: str,
         score_threshold: float,
@@ -647,7 +659,7 @@ class GenerateMaskHintWorker(QThread):
         super().__init__()
         self._source_path = source_path
         self._clip_root = clip_root
-        self._selection = selection
+        self._selections = selections
         self._manager = manager
         self._preferred_device = preferred_device
         self._score_threshold = score_threshold
@@ -667,8 +679,11 @@ class GenerateMaskHintWorker(QThread):
                 raise RuntimeError(f"Could not open source video: {self._source_path}")
 
             total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-            tracker = _create_tracker()
-            previous_box = self._selection.box
+            trackers = []
+            previous_boxes = [selection.box for selection in self._selections]
+            for selection in self._selections:
+                tracker = _create_tracker()
+                trackers.append(tracker)
 
             frame_index = 0
             while True:
@@ -678,35 +693,51 @@ class GenerateMaskHintWorker(QThread):
 
                 frame_rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
                 if frame_index == 0:
-                    chosen_mask = self._selection.mask
-                    if tracker is not None:
-                        tracker.init(frame_bgr, _xyxy_to_xywh(previous_box))
+                    chosen_masks = [selection.mask for selection in self._selections]
+                    for tracker, previous_box in zip(trackers, previous_boxes):
+                        if tracker is not None:
+                            tracker.init(frame_bgr, _xyxy_to_xywh(previous_box))
                 else:
-                    tracked_box = None
-                    if tracker is not None:
-                        tracker_ok, tracker_box = tracker.update(frame_bgr)
-                        if tracker_ok:
-                            tracked_box = _xywh_to_xyxy(tracker_box)
-
                     candidates, _device_name = self._manager.detect_candidates(
                         frame_rgb,
                         self._preferred_device,
                         self._score_threshold,
                     )
-                    best = self._choose_candidate(candidates, tracked_box or previous_box)
+                    remaining_candidates = list(candidates)
+                    chosen_masks = []
 
-                    if best is not None:
-                        chosen_mask = best.mask
-                        previous_box = best.box
+                    for idx, selection in enumerate(self._selections):
+                        tracked_box = None
+                        tracker = trackers[idx]
                         if tracker is not None:
+                            tracker_ok, tracker_box = tracker.update(frame_bgr)
+                            if tracker_ok:
+                                tracked_box = _xywh_to_xyxy(tracker_box)
+
+                        best = self._choose_candidate(
+                            selection,
+                            remaining_candidates,
+                            tracked_box or previous_boxes[idx],
+                        )
+
+                        if best is not None:
+                            chosen_masks.append(best.mask)
+                            previous_boxes[idx] = best.box
+                            if best in remaining_candidates:
+                                remaining_candidates.remove(best)
                             tracker = _create_tracker()
+                            trackers[idx] = tracker
                             if tracker is not None:
-                                tracker.init(frame_bgr, _xyxy_to_xywh(previous_box))
-                    elif tracked_box is not None:
-                        previous_box = _clip_box(tracked_box, frame_rgb.shape[1], frame_rgb.shape[0])
-                        chosen_mask = _rectangle_mask(frame_rgb.shape[:2], previous_box)
-                    else:
-                        chosen_mask = np.zeros(frame_rgb.shape[:2], dtype=np.float32)
+                                tracker.init(frame_bgr, _xyxy_to_xywh(previous_boxes[idx]))
+                        elif tracked_box is not None:
+                            previous_boxes[idx] = _clip_box(tracked_box, frame_rgb.shape[1], frame_rgb.shape[0])
+                            chosen_masks.append(_rectangle_mask(frame_rgb.shape[:2], previous_boxes[idx]))
+                        else:
+                            chosen_masks.append(np.zeros(frame_rgb.shape[:2], dtype=np.float32))
+
+                chosen_mask = np.zeros(frame_rgb.shape[:2], dtype=np.float32)
+                for mask in chosen_masks:
+                    chosen_mask = np.maximum(chosen_mask, mask.astype(np.float32))
 
                 hint = _coarse_hint_from_mask(chosen_mask, self._blur_size, self._erode_size)
                 out_path = os.path.join(alpha_dir, f"frame_{frame_index:06d}.png")
@@ -727,10 +758,11 @@ class GenerateMaskHintWorker(QThread):
 
     def _choose_candidate(
         self,
+        selection: SegmentationCandidate,
         candidates: list[SegmentationCandidate],
         reference_box: tuple[int, int, int, int],
     ) -> SegmentationCandidate | None:
-        filtered = [item for item in candidates if item.label_id == self._selection.label_id]
+        filtered = [item for item in candidates if item.label_id == selection.label_id]
         if not filtered:
             filtered = candidates
         if not filtered:
@@ -813,7 +845,7 @@ class CorridorKeyWindow(QMainWindow):
         self.loaded_alpha_path: str | None = None
         self.current_frame_index = 0
         self.candidates: list[SegmentationCandidate] = []
-        self.selected_candidate_index: int | None = None
+        self.selected_candidate_indices: set[int] = set()
         self.detect_worker: DetectObjectsWorker | None = None
         self.mask_worker: GenerateMaskHintWorker | None = None
         self.export_worker: ExportWorker | None = None
@@ -1053,7 +1085,7 @@ class CorridorKeyWindow(QMainWindow):
             self.loaded_alpha_path = None
             self.current_frame_index = 0
             self.candidates = []
-            self.selected_candidate_index = None
+            self.selected_candidate_indices.clear()
 
             self.source_edit.setText(path)
             self.alpha_edit.clear()
@@ -1086,7 +1118,7 @@ class CorridorKeyWindow(QMainWindow):
             self.loaded_alpha_path = path
             self.alpha_edit.setText(path)
             self.candidates = []
-            self.selected_candidate_index = None
+            self.selected_candidate_indices.clear()
             self._update_previews()
             self._log(f"Imported mask hint: {target}")
             self._set_status("Mask hint loaded. Export is now available.")
@@ -1126,18 +1158,18 @@ class CorridorKeyWindow(QMainWindow):
 
     def _on_candidates_ready(self, candidates: list[SegmentationCandidate], device_name: str) -> None:
         self.candidates = candidates
-        self.selected_candidate_index = None
+        self.selected_candidate_indices.clear()
         self.segment_device_label.setText(f"Segmentation device: {device_name}")
         self._update_previews()
         if candidates:
-            self._set_status("Click the object you want in the top preview, then generate the mask hint.")
+            self._set_status("Click an object in the top preview. Hold Shift to add or remove more objects.")
             self._log(f"Detected {len(candidates)} candidate objects on frame 0.")
         else:
             self._set_status("No candidate objects were found on frame 0.")
             self._log("Segmentation model found no objects on frame 0.")
         self._refresh_actions()
 
-    def _handle_video_click(self, image_x: int, image_y: int) -> None:
+    def _handle_video_click(self, image_x: int, image_y: int, shift_held: bool) -> None:
         if self.current_frame_index != 0 or not self.candidates:
             return
         if self.source_reader is None:
@@ -1156,26 +1188,42 @@ class CorridorKeyWindow(QMainWindow):
             self._set_status("That click did not land on a detected object.")
             return
 
-        self.selected_candidate_index = hit_index
-        candidate = self.candidates[hit_index]
-        self.mask_view.set_rgb_image(_mask_to_preview(_coarse_hint_from_mask(candidate.mask, 0, 0)))
+        if shift_held:
+            if hit_index in self.selected_candidate_indices:
+                self.selected_candidate_indices.remove(hit_index)
+            else:
+                self.selected_candidate_indices.add(hit_index)
+        else:
+            self.selected_candidate_indices = {hit_index}
+
+        selected_candidates = [self.candidates[index] for index in sorted(self.selected_candidate_indices)]
+        merged_mask = _merge_candidate_masks(selected_candidates)
+        if merged_mask is not None:
+            self.mask_view.set_rgb_image(_mask_to_preview(_coarse_hint_from_mask(merged_mask, 0, 0)))
         self._update_previews()
-        self._set_status(f"Selected '{candidate.label_name}'. Generate the mask hint when ready.")
+        selection_count = len(self.selected_candidate_indices)
+        if selection_count == 0:
+            self._set_status("Selection cleared.")
+        elif selection_count == 1:
+            candidate = selected_candidates[0]
+            self._set_status(f"Selected '{candidate.label_name}'. Hold Shift and click to add more objects.")
+        else:
+            self._set_status(f"Selected {selection_count} objects. Generate the mask hint when ready.")
         self._refresh_actions()
 
     def _generate_mask_hint(self) -> None:
         if self.clip is None or self.source_reader is None:
             self._show_error("Load a source video first.")
             return
-        if self.selected_candidate_index is None:
-            self._show_error("Detect objects first, then click the one you want.")
+        if not self.selected_candidate_indices:
+            self._show_error("Detect objects first, then click one or more objects.")
             return
 
-        selection = self.candidates[self.selected_candidate_index]
+        selections = [self.candidates[index] for index in sorted(self.selected_candidate_indices)]
         self.mask_worker = GenerateMaskHintWorker(
             source_path=self.clip.input_asset.path,
             clip_root=self.clip.root_path,
-            selection=selection,
+            selections=selections,
             manager=self.segmentation_manager,
             preferred_device=self.device,
             score_threshold=self.score_spin.value(),
@@ -1287,9 +1335,9 @@ class CorridorKeyWindow(QMainWindow):
 
         source_frame = self.source_reader.read_rgb(self.current_frame_index)
         if source_frame is not None:
-            selected_index = self.selected_candidate_index if self.current_frame_index == 0 else None
+            selected_indices = self.selected_candidate_indices if self.current_frame_index == 0 else set()
             if self.current_frame_index == 0 and self.candidates:
-                self.video_view.set_rgb_image(_overlay_candidates(source_frame, self.candidates, selected_index))
+                self.video_view.set_rgb_image(_overlay_candidates(source_frame, self.candidates, selected_indices))
             else:
                 self.video_view.set_rgb_image(source_frame)
 
@@ -1297,9 +1345,11 @@ class CorridorKeyWindow(QMainWindow):
             alpha_frame = self.alpha_reader.read_rgb(self.current_frame_index)
             if alpha_frame is not None:
                 self.mask_view.set_rgb_image(alpha_frame)
-        elif self.selected_candidate_index is not None:
-            selected = self.candidates[self.selected_candidate_index]
-            self.mask_view.set_rgb_image(_mask_to_preview(_coarse_hint_from_mask(selected.mask, 0, 0)))
+        elif self.selected_candidate_indices:
+            selected = [self.candidates[index] for index in sorted(self.selected_candidate_indices)]
+            merged_mask = _merge_candidate_masks(selected)
+            if merged_mask is not None:
+                self.mask_view.set_rgb_image(_mask_to_preview(_coarse_hint_from_mask(merged_mask, 0, 0)))
         else:
             self.mask_view.set_placeholder("Mask Hint\nDrop a mask asset or generate one")
 
@@ -1309,7 +1359,7 @@ class CorridorKeyWindow(QMainWindow):
     def _refresh_actions(self) -> None:
         busy = self.detect_worker is not None or self.mask_worker is not None or self.export_worker is not None
         has_source = self.clip is not None and self.source_reader is not None
-        has_selection = self.selected_candidate_index is not None
+        has_selection = bool(self.selected_candidate_indices)
         has_alpha = self.clip is not None and self.clip.alpha_asset is not None
 
         self.detect_button.setEnabled(has_source and not busy)
