@@ -119,11 +119,11 @@ import torch
 from backend.clip_state import ClipEntry
 from backend.errors import JobCancelledError
 from backend.job_queue import GPUJob, JobType
+from backend.prefetch import iter_prefetched_items
 from backend.project import create_project, get_clip_dirs, is_image_file, is_video_file
 from backend.sam2_runtime import (
     Sam2PrefetchedBatch,
     apply_torch_inference_optimizations,
-    iter_prefetched_batches,
     merge_sam2_masks,
     sam2_preprocess_batch_size,
     sam2_session_devices,
@@ -740,7 +740,7 @@ class SegmentationModelManager:
                     original_sizes=frame_inputs["original_sizes"],
                 )
 
-            for batch in iter_prefetched_batches(_load_next_batch, prefetch_count=_SAM2_PREFETCH_DEPTH):
+            for batch in iter_prefetched_items(_load_next_batch, prefetch_count=_SAM2_PREFETCH_DEPTH):
                 if cancel_event.is_set():
                     raise JobCancelledError(Path(clip_root).name, batch.start_frame_index)
 

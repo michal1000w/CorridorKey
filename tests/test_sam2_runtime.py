@@ -4,8 +4,8 @@ import numpy as np
 import pytest
 import torch
 
+from backend.prefetch import iter_prefetched_items
 from backend.sam2_runtime import (
-    iter_prefetched_batches,
     merge_sam2_masks,
     sam2_preprocess_batch_size,
     sam2_session_devices,
@@ -43,16 +43,16 @@ def test_sam2_preprocess_batch_size_uses_user_value():
     assert sam2_preprocess_batch_size("mps", 0) == 1
 
 
-def test_iter_prefetched_batches_preserves_order():
+def test_iter_prefetched_items_preserves_order():
     items = iter([1, 2, 3])
 
     def load_next():
         return next(items, None)
 
-    assert list(iter_prefetched_batches(load_next, prefetch_count=2)) == [1, 2, 3]
+    assert list(iter_prefetched_items(load_next, prefetch_count=2)) == [1, 2, 3]
 
 
-def test_iter_prefetched_batches_raises_producer_error():
+def test_iter_prefetched_items_raises_producer_error():
     state = {"calls": 0}
 
     def load_next():
@@ -61,7 +61,7 @@ def test_iter_prefetched_batches_raises_producer_error():
             return "batch-0"
         raise RuntimeError("prefetch failed")
 
-    iterator = iter_prefetched_batches(load_next, prefetch_count=2)
+    iterator = iter_prefetched_items(load_next, prefetch_count=2)
     assert next(iterator) == "batch-0"
     with pytest.raises(RuntimeError, match="prefetch failed"):
         next(iterator)

@@ -8,6 +8,8 @@ import logging
 import os
 import platform
 import sys
+from concurrent.futures import ThreadPoolExecutor
+from dataclasses import dataclass
 from pathlib import Path
 
 import numpy as np
@@ -23,6 +25,26 @@ BACKEND_ENV_VAR = "CORRIDORKEY_BACKEND"
 VALID_BACKENDS = ("auto", "torch", "mlx")
 _MLX_IMAGENET_MEAN = np.array([0.485, 0.456, 0.406], dtype=np.float32)
 _MLX_IMAGENET_STD = np.array([0.229, 0.224, 0.225], dtype=np.float32)
+_MAX_MLX_PREPARE_WORKERS = 8
+
+
+@dataclass
+class _PreparedMLXGroup:
+    indices: list[int]
+    inputs_np: np.ndarray
+    original_sizes: list[tuple[int, int]]
+
+
+@dataclass
+class _PreparedMLXBatch:
+    full_frame: bool
+    groups: list[_PreparedMLXGroup]
+    batch_size: int
+    refiner_scale: float
+    fg_is_straight: bool
+    despill_strength: float
+    auto_despeckle: bool
+    despeckle_size: int
 
 
 def resolve_backend(requested: str | None = None) -> str:
@@ -309,37 +331,94 @@ class _MLXEngineAdapter:
             fg_coarse * (1.0 - s) + fg_refined * s,
         )
 
-    def _prepare_full_frame_batch(self, images_u8: list[np.ndarray], masks_u8: list[np.ndarray]) -> tuple[np.ndarray, list[tuple[int, int]]]:
+    @staticmethod
+    def _prepare_worker_count(item_count: int) -> int:
+        cpu_count = os.cpu_count() or 1
+        return max(1, min(item_count, cpu_count, _MAX_MLX_PREPARE_WORKERS))
+
+    def _parallel_prepare_items(self, items, prepare_item):
+        worker_count = self._prepare_worker_count(len(items))
+        if worker_count == 1:
+            return [prepare_item(*item) for item in items]
+
+        with ThreadPoolExecutor(max_workers=worker_count, thread_name_prefix="mlx-prepare") as executor:
+            return list(executor.map(lambda item: prepare_item(*item), items))
+
+    def _prepare_full_frame_item(self, image_u8: np.ndarray, mask_u8: np.ndarray) -> tuple[np.ndarray, tuple[int, int]]:
         from PIL import Image
 
-        rgb_batch: list[np.ndarray] = []
-        mask_batch: list[np.ndarray] = []
-        original_sizes: list[tuple[int, int]] = []
         target_size = self._engine._img_size
+        original_size = image_u8.shape[:2]
 
-        for image_u8, mask_u8 in zip(images_u8, masks_u8):
-            original_sizes.append(image_u8.shape[:2])
+        if image_u8.shape[0] != target_size or image_u8.shape[1] != target_size:
+            rgb_resized = np.asarray(
+                Image.fromarray(image_u8, mode="RGB").resize((target_size, target_size), Image.Resampling.BICUBIC),
+                dtype=np.float32,
+            )
+            mask_resized = np.asarray(
+                Image.fromarray(mask_u8, mode="L").resize((target_size, target_size), Image.Resampling.BICUBIC),
+                dtype=np.float32,
+            )
+        else:
+            rgb_resized = image_u8.astype(np.float32)
+            mask_resized = mask_u8.astype(np.float32)
 
-            if image_u8.shape[0] != target_size or image_u8.shape[1] != target_size:
-                rgb_resized = np.asarray(
-                    Image.fromarray(image_u8, mode="RGB").resize((target_size, target_size), Image.Resampling.BICUBIC),
-                    dtype=np.float32,
+        rgb_norm = (rgb_resized / 255.0 - _MLX_IMAGENET_MEAN) / _MLX_IMAGENET_STD
+        mask_norm = (mask_resized[:, :, np.newaxis] / 255.0).astype(np.float32, copy=False)
+        combined = np.concatenate([rgb_norm.astype(np.float32, copy=False), mask_norm], axis=-1)
+        return combined.astype(np.float32, copy=False), original_size
+
+    def _prepare_full_frame_batch(
+        self,
+        images_u8: list[np.ndarray],
+        masks_u8: list[np.ndarray],
+    ) -> tuple[np.ndarray, list[tuple[int, int]]]:
+        prepared_items = self._parallel_prepare_items(
+            list(zip(images_u8, masks_u8, strict=True)),
+            self._prepare_full_frame_item,
+        )
+        inputs_np = np.stack([combined for combined, _original_size in prepared_items], axis=0)
+        original_sizes = [original_size for _combined, original_size in prepared_items]
+        return inputs_np.astype(np.float32, copy=False), original_sizes
+
+    @staticmethod
+    def _prepare_tiled_item(image_u8: np.ndarray, mask_u8: np.ndarray) -> tuple[np.ndarray, tuple[int, int]]:
+        original_size = image_u8.shape[:2]
+        rgb_norm = (image_u8.astype(np.float32) / 255.0 - _MLX_IMAGENET_MEAN) / _MLX_IMAGENET_STD
+        mask_norm = (mask_u8[:, :, np.newaxis].astype(np.float32) / 255.0).astype(np.float32, copy=False)
+        combined = np.concatenate([rgb_norm.astype(np.float32, copy=False), mask_norm], axis=-1)
+        return combined.astype(np.float32, copy=False), original_size
+
+    def _prepare_tiled_batch(
+        self,
+        images_u8: list[np.ndarray],
+        masks_u8: list[np.ndarray],
+    ) -> list[_PreparedMLXGroup]:
+        prepared_items = self._parallel_prepare_items(
+            list(zip(images_u8, masks_u8, strict=True)),
+            self._prepare_tiled_item,
+        )
+
+        grouped: dict[tuple[int, int], dict[str, list]] = {}
+        for idx, (combined, original_size) in enumerate(prepared_items):
+            bucket = grouped.setdefault(
+                original_size,
+                {"indices": [], "arrays": [], "original_sizes": []},
+            )
+            bucket["indices"].append(idx)
+            bucket["arrays"].append(combined)
+            bucket["original_sizes"].append(original_size)
+
+        groups: list[_PreparedMLXGroup] = []
+        for bucket in grouped.values():
+            groups.append(
+                _PreparedMLXGroup(
+                    indices=bucket["indices"],
+                    inputs_np=np.stack(bucket["arrays"], axis=0).astype(np.float32, copy=False),
+                    original_sizes=bucket["original_sizes"],
                 )
-                mask_resized = np.asarray(
-                    Image.fromarray(mask_u8, mode="L").resize((target_size, target_size), Image.Resampling.BICUBIC),
-                    dtype=np.float32,
-                )
-            else:
-                rgb_resized = image_u8.astype(np.float32)
-                mask_resized = mask_u8.astype(np.float32)
-
-            rgb_batch.append(rgb_resized / 255.0)
-            mask_batch.append(mask_resized[:, :, np.newaxis] / 255.0)
-
-        rgb_np = np.stack(rgb_batch, axis=0)
-        mask_np = np.stack(mask_batch, axis=0)
-        combined = np.concatenate([(rgb_np - _MLX_IMAGENET_MEAN) / _MLX_IMAGENET_STD, mask_np], axis=-1)
-        return combined.astype(np.float32), original_sizes
+            )
+        return groups
 
     def _finalize_full_frame_batch(
         self,
@@ -380,9 +459,18 @@ class _MLXEngineAdapter:
         refiner_scale: float,
         fg_is_straight: bool,
     ) -> list[dict[str, np.ndarray]]:
+        inputs_np, original_sizes = self._prepare_full_frame_batch(images_u8, masks_u8)
+        return self._run_full_frame_prepared(inputs_np, original_sizes, refiner_scale, fg_is_straight)
+
+    def _run_full_frame_prepared(
+        self,
+        inputs_np: np.ndarray,
+        original_sizes: list[tuple[int, int]],
+        refiner_scale: float,
+        fg_is_straight: bool,
+    ) -> list[dict[str, np.ndarray]]:
         import mlx.core as mx
 
-        inputs_np, original_sizes = self._prepare_full_frame_batch(images_u8, masks_u8)
         x = mx.array(inputs_np)
         outputs = self._engine._model(x)
         alpha_out, fg_out = self._select_mlx_outputs(outputs, refiner_scale)
@@ -402,11 +490,27 @@ class _MLXEngineAdapter:
         refiner_scale: float,
         fg_is_straight: bool,
     ) -> list[dict[str, np.ndarray]]:
+        prepared_groups = self._prepare_tiled_batch(images_u8, masks_u8)
+        if len(prepared_groups) != 1:
+            raise RuntimeError("Expected one same-shape MLX group during tiled batch preparation")
+        prepared_group = prepared_groups[0]
+        return self._run_tiled_prepared_same_shape(
+            prepared_group.inputs_np,
+            prepared_group.original_sizes,
+            refiner_scale,
+            fg_is_straight,
+        )
+
+    def _run_tiled_prepared_same_shape(
+        self,
+        inputs_np: np.ndarray,
+        original_sizes: list[tuple[int, int]],
+        refiner_scale: float,
+        fg_is_straight: bool,
+    ) -> list[dict[str, np.ndarray]]:
         import mlx.core as mx
 
-        rgb_np = np.stack([image.astype(np.float32) / 255.0 for image in images_u8], axis=0)
-        mask_np = np.stack([mask[:, :, np.newaxis].astype(np.float32) / 255.0 for mask in masks_u8], axis=0)
-        x = mx.array(np.concatenate([(rgb_np - _MLX_IMAGENET_MEAN) / _MLX_IMAGENET_STD, mask_np], axis=-1))
+        x = mx.array(inputs_np)
 
         batch_size, full_h, full_w, _ = x.shape
         tile_size = self._engine._tile_size
@@ -416,7 +520,7 @@ class _MLXEngineAdapter:
             outputs = self._engine._model(x)
             alpha_out, fg_out = self._select_mlx_outputs(outputs, refiner_scale)
             mx.eval(alpha_out, fg_out)  # noqa: S307
-            results = self._finalize_full_frame_batch(alpha_out, fg_out, [img.shape[:2] for img in images_u8], fg_is_straight)
+            results = self._finalize_full_frame_batch(alpha_out, fg_out, original_sizes, fg_is_straight)
             del outputs, alpha_out, fg_out, x
             gc.collect()
             mx.clear_cache()
@@ -464,7 +568,7 @@ class _MLXEngineAdapter:
         alpha_final = alpha_accum / np.maximum(weight_accum, 1e-8)
         fg_final = fg_accum / np.maximum(weight_accum, 1e-8)
 
-        results = self._finalize_full_frame_batch(alpha_final, fg_final, [img.shape[:2] for img in images_u8], fg_is_straight)
+        results = self._finalize_full_frame_batch(alpha_final, fg_final, original_sizes, fg_is_straight)
         del x
         gc.collect()
         mx.clear_cache()
@@ -477,24 +581,104 @@ class _MLXEngineAdapter:
         refiner_scale: float,
         fg_is_straight: bool,
     ) -> list[dict[str, np.ndarray]]:
-        grouped_indices: dict[tuple[int, int], list[int]] = {}
-        for idx, image_u8 in enumerate(images_u8):
-            grouped_indices.setdefault(image_u8.shape[:2], []).append(idx)
+        prepared_groups = self._prepare_tiled_batch(images_u8, masks_u8)
+        return self._run_tiled_prepared(prepared_groups, len(images_u8), refiner_scale, fg_is_straight)
 
-        raw_results: list[dict[str, np.ndarray] | None] = [None] * len(images_u8)
-        for indices in grouped_indices.values():
-            batch_results = self._run_tiled_batch_same_shape(
-                [images_u8[idx] for idx in indices],
-                [masks_u8[idx] for idx in indices],
+    def _run_tiled_prepared(
+        self,
+        prepared_groups: list[_PreparedMLXGroup],
+        batch_size: int,
+        refiner_scale: float,
+        fg_is_straight: bool,
+    ) -> list[dict[str, np.ndarray]]:
+        raw_results: list[dict[str, np.ndarray] | None] = [None] * batch_size
+        for prepared_group in prepared_groups:
+            batch_results = self._run_tiled_prepared_same_shape(
+                prepared_group.inputs_np,
+                prepared_group.original_sizes,
                 refiner_scale,
                 fg_is_straight,
             )
-            for idx, result in zip(indices, batch_results):
+            for idx, result in zip(prepared_group.indices, batch_results, strict=True):
                 raw_results[idx] = result
 
         if any(result is None for result in raw_results):
             raise RuntimeError("MLX tiled batch inference failed to produce outputs for all frames")
         return [result for result in raw_results if result is not None]
+
+    def prepare_batch(
+        self,
+        images,
+        masks_linear,
+        refiner_scale=1.0,
+        input_is_linear=False,
+        fg_is_straight=True,
+        despill_strength=1.0,
+        auto_despeckle=True,
+        despeckle_size=400,
+    ):
+        """Prepare an MLX batch on CPU so GPU dispatch can happen with less host-side work."""
+        del input_is_linear
+
+        if len(images) != len(masks_linear):
+            raise ValueError("images and masks_linear must have the same length")
+        if not images:
+            raise ValueError("images must not be empty")
+
+        images_u8 = [self._to_u8_image(image) for image in images]
+        masks_u8 = [self._to_u8_mask(mask_linear) for mask_linear in masks_linear]
+
+        if self._engine._tiled:
+            groups = self._prepare_tiled_batch(images_u8, masks_u8)
+            full_frame = False
+        else:
+            inputs_np, original_sizes = self._prepare_full_frame_batch(images_u8, masks_u8)
+            groups = [
+                _PreparedMLXGroup(
+                    indices=list(range(len(images_u8))),
+                    inputs_np=inputs_np,
+                    original_sizes=original_sizes,
+                )
+            ]
+            full_frame = True
+
+        return _PreparedMLXBatch(
+            full_frame=full_frame,
+            groups=groups,
+            batch_size=len(images_u8),
+            refiner_scale=refiner_scale,
+            fg_is_straight=fg_is_straight,
+            despill_strength=despill_strength,
+            auto_despeckle=auto_despeckle,
+            despeckle_size=despeckle_size,
+        )
+
+    def process_prepared_batch(self, prepared_batch: _PreparedMLXBatch):
+        """Run MLX inference from a CPU-prepared batch."""
+        if prepared_batch.full_frame:
+            raw_outputs = self._run_full_frame_prepared(
+                prepared_batch.groups[0].inputs_np,
+                prepared_batch.groups[0].original_sizes,
+                prepared_batch.refiner_scale,
+                prepared_batch.fg_is_straight,
+            )
+        else:
+            raw_outputs = self._run_tiled_prepared(
+                prepared_batch.groups,
+                prepared_batch.batch_size,
+                prepared_batch.refiner_scale,
+                prepared_batch.fg_is_straight,
+            )
+
+        return [
+            _wrap_mlx_output(
+                raw,
+                prepared_batch.despill_strength,
+                prepared_batch.auto_despeckle,
+                prepared_batch.despeckle_size,
+            )
+            for raw in raw_outputs
+        ]
 
     def process_batch(
         self,
@@ -512,32 +696,17 @@ class _MLXEngineAdapter:
             raise ValueError("images and masks_linear must have the same length")
         if not images:
             return []
-        if len(images) == 1:
-            return [
-                self.process_frame(
-                    images[0],
-                    masks_linear[0],
-                    refiner_scale=refiner_scale,
-                    input_is_linear=input_is_linear,
-                    fg_is_straight=fg_is_straight,
-                    despill_strength=despill_strength,
-                    auto_despeckle=auto_despeckle,
-                    despeckle_size=despeckle_size,
-                )
-            ]
-
-        images_u8 = [self._to_u8_image(image) for image in images]
-        masks_u8 = [self._to_u8_mask(mask_linear) for mask_linear in masks_linear]
-
-        if self._engine._tiled:
-            raw_outputs = self._run_tiled_batch(images_u8, masks_u8, refiner_scale, fg_is_straight)
-        else:
-            raw_outputs = self._run_full_frame_batch(images_u8, masks_u8, refiner_scale, fg_is_straight)
-
-        return [
-            _wrap_mlx_output(raw, despill_strength, auto_despeckle, despeckle_size)
-            for raw in raw_outputs
-        ]
+        prepared_batch = self.prepare_batch(
+            images,
+            masks_linear,
+            refiner_scale=refiner_scale,
+            input_is_linear=input_is_linear,
+            fg_is_straight=fg_is_straight,
+            despill_strength=despill_strength,
+            auto_despeckle=auto_despeckle,
+            despeckle_size=despeckle_size,
+        )
+        return self.process_prepared_batch(prepared_batch)
 
     def process_frame(
         self,

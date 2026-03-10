@@ -50,6 +50,7 @@ from .frame_io import (
     read_video_mask_at,
 )
 from .job_queue import GPUJob, GPUJobQueue
+from .prefetch import iter_prefetched_items
 from .validators import (
     ensure_output_dirs,
     validate_frame_counts,
@@ -58,6 +59,7 @@ from .validators import (
 )
 
 logger = logging.getLogger(__name__)
+_EXPORT_PREFETCH_DEPTH = 4
 
 # Project paths — frozen-build aware
 if getattr(sys, "frozen", False):
@@ -138,6 +140,18 @@ class FrameResult:
     input_stem: str
     success: bool
     warning: str | None = None
+
+
+@dataclass
+class _PrefetchedInferenceBatch:
+    """A partially processed export batch with any early frame outcomes attached."""
+
+    batch_images: list[np.ndarray]
+    batch_masks: list[np.ndarray]
+    batch_meta: list[tuple[int, str, bool]]
+    prepared_batch: Any | None
+    early_results: list[FrameResult]
+    early_warnings: list[str]
 
 
 class CorridorKeyService:
@@ -629,17 +643,27 @@ class CorridorKeyService:
             if on_progress:
                 on_progress(clip.name, 0, range_count)
 
+            prepare_batch = getattr(engine, "prepare_batch", None)
             process_batch = getattr(engine, "process_batch", None)
+            process_prepared_batch = getattr(engine, "process_prepared_batch", None)
+            use_prepared_engine = callable(prepare_batch) and callable(process_prepared_batch)
             use_batched_engine = callable(process_batch)
 
             offset = 0
-            while offset < len(frame_list):
+
+            def _load_next_inference_batch() -> _PrefetchedInferenceBatch | None:
+                nonlocal offset
+                if offset >= len(frame_list):
+                    return None
+
                 if job and job.is_cancelled:
                     raise JobCancelledError(clip.name, frame_list[offset])
 
                 batch_images: list[np.ndarray] = []
                 batch_masks: list[np.ndarray] = []
                 batch_meta: list[tuple[int, str, bool]] = []
+                early_results: list[FrameResult] = []
+                early_warnings: list[str] = []
 
                 while offset < len(frame_list) and len(batch_images) < requested_batch:
                     i = frame_list[offset]
@@ -655,26 +679,17 @@ class CorridorKeyService:
                         )
                         if img is None:
                             skipped.append(i)
-                            results.append(FrameResult(i, f"{i:05d}", False, "video read failed"))
-                            completed_progress += 1
-                            if on_progress:
-                                on_progress(clip.name, completed_progress, range_count)
+                            early_results.append(FrameResult(i, f"{i:05d}", False, "video read failed"))
                             continue
 
                         if input_stem in skip_stems:
-                            results.append(FrameResult(i, input_stem, True, "resumed (skipped)"))
-                            completed_progress += 1
-                            if on_progress:
-                                on_progress(clip.name, completed_progress, range_count)
+                            early_results.append(FrameResult(i, input_stem, True, "resumed (skipped)"))
                             continue
 
                         mask = self._read_alpha_frame(clip, i, alpha_files, alpha_cap)
                         if mask is None:
                             skipped.append(i)
-                            results.append(FrameResult(i, input_stem, False, "alpha read failed"))
-                            completed_progress += 1
-                            if on_progress:
-                                on_progress(clip.name, completed_progress, range_count)
+                            early_results.append(FrameResult(i, input_stem, False, "alpha read failed"))
                             continue
 
                         if mask.shape[:2] != img.shape[:2]:
@@ -687,19 +702,61 @@ class CorridorKeyService:
                     except FrameReadError as e:
                         logger.warning(str(e))
                         skipped.append(i)
-                        results.append(FrameResult(i, f"{i:05d}", False, str(e)))
-                        completed_progress += 1
-                        if on_warning:
-                            on_warning(str(e))
-                        if on_progress:
-                            on_progress(clip.name, completed_progress, range_count)
+                        early_results.append(FrameResult(i, f"{i:05d}", False, str(e)))
+                        early_warnings.append(str(e))
+
+                if not batch_images and not early_results:
+                    return None
+
+                prepared_batch = None
+                if batch_images and use_prepared_engine:
+                    prepared_batch = prepare_batch(
+                        batch_images,
+                        batch_masks,
+                        input_is_linear=params.input_is_linear,
+                        fg_is_straight=True,
+                        despill_strength=params.despill_strength,
+                        auto_despeckle=params.auto_despeckle,
+                        despeckle_size=params.despeckle_size,
+                        refiner_scale=params.refiner_scale,
+                    )
+
+                return _PrefetchedInferenceBatch(
+                    batch_images=batch_images,
+                    batch_masks=batch_masks,
+                    batch_meta=batch_meta,
+                    prepared_batch=prepared_batch,
+                    early_results=early_results,
+                    early_warnings=early_warnings,
+                )
+
+            for prefetched_batch in iter_prefetched_items(
+                _load_next_inference_batch,
+                prefetch_count=_EXPORT_PREFETCH_DEPTH,
+            ):
+                for warning in prefetched_batch.early_warnings:
+                    if on_warning:
+                        on_warning(warning)
+
+                for early_result in prefetched_batch.early_results:
+                    results.append(early_result)
+                    completed_progress += 1
+                    if on_progress:
+                        on_progress(clip.name, completed_progress, range_count)
+
+                batch_images = prefetched_batch.batch_images
+                batch_masks = prefetched_batch.batch_masks
+                batch_meta = prefetched_batch.batch_meta
+                prepared_batch = prefetched_batch.prepared_batch
 
                 if not batch_images:
                     continue
 
                 t_batch = time.monotonic()
                 with self._gpu_lock:
-                    if use_batched_engine:
+                    if prepared_batch is not None:
+                        batch_results = process_prepared_batch(prepared_batch)
+                    elif use_batched_engine:
                         batch_results = process_batch(
                             batch_images,
                             batch_masks,
@@ -722,7 +779,9 @@ class CorridorKeyService:
                                 despeckle_size=params.despeckle_size,
                                 refiner_scale=params.refiner_scale,
                             )
-                            for image, mask, (_idx, _stem, is_linear) in zip(batch_images, batch_masks, batch_meta)
+                            for image, mask, (_idx, _stem, is_linear) in zip(
+                                batch_images, batch_masks, batch_meta, strict=True
+                            )
                         ]
 
                 logger.debug(
@@ -734,7 +793,7 @@ class CorridorKeyService:
                         f"Engine returned {len(batch_results)} results for a batch of {len(batch_meta)} frames"
                     )
 
-                for res, (i, input_stem, _is_linear) in zip(batch_results, batch_meta):
+                for res, (i, input_stem, _is_linear) in zip(batch_results, batch_meta, strict=True):
                     if job and job.is_cancelled:
                         raise JobCancelledError(clip.name, i)
                     try:
