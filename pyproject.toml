@@ -3,7 +3,7 @@ name = "corridorkey"
 version = "1.0.0"
 description = "Neural network green screen keying for professional VFX pipelines"
 readme = "README.md"
-requires-python = ">=3.10, <=3.14"
+requires-python = ">=3.10, <3.15"
 license = { text = "CC-BY-NC-SA-4.0" }
 authors = [{ name = "Corridor Digital" }]
 
@@ -17,6 +17,9 @@ dependencies = [
     "opencv-python-headless; sys_platform == 'darwin'",
     "tqdm",
     "setuptools",
+    # Triton fix for Windows
+    # There might still be issues though https://github.com/triton-lang/triton-windows?tab=readme-ov-file#windows-file-path-length-limit-260-causes-compilation-failure
+    "triton-windows==3.6.0.post25 ; sys_platform == 'win32'",
 
     # GVM alpha hint generator
     "diffusers",
@@ -29,21 +32,20 @@ dependencies = [
     "easydict",
     "imageio",
     "matplotlib",
-
     # VideoMaMa alpha hint generator
     "einops",
-
     # CLI tools (huggingface-hub is also a transitive dep, but must be direct
     # so that uv installs the "hf" console-script entry point)
     "huggingface-hub",
+
+    # CLI framework + terminal output
+    "typer>=0.12",
+    "rich>=13",
 ]
 
 [dependency-groups]
-dev = [
-    "pytest",
-    "pytest-cov",
-    "ruff",
-]
+dev = ["pytest", "pytest-cov", "ruff"]
+docs = ["zensical>=0.0.24"]
 
 [project.scripts]
 corridorkey = "corridorkey_cli:main"
@@ -84,14 +86,18 @@ omit = [
     "gvm_core/*",
     "VideoMaMaInferenceModule/*",
     "tests/*",
-    "test_vram.py",  # manual GPU smoke test, not part of the pytest suite
+    "test_vram.py",               # manual GPU smoke test, not part of the pytest suite
 ]
 
 [[tool.uv.index]]
 name = "pytorch"
-url = "https://download.pytorch.org/whl/cu126"
+url = "https://download.pytorch.org/whl/cu128" # CUDA 12.6 doesn't support RTX 5000 Series
 explicit = true
 
+# Mac (darwin) uses PyPI's default torch wheels, which include MPS support.
+# Linux/Windows pull from the explicit CUDA 12.6 index above.
 [tool.uv.sources]
 torch = { index = "pytorch", marker = "sys_platform != 'darwin'" }
 torchvision = { index = "pytorch", marker = "sys_platform != 'darwin'" }
+# Use Hiera fix in order to utilize the FlashAttention Kernel
+timm = { git = "https://github.com/Raiden129/pytorch-image-models-fix", branch = "fix/hiera-flash-attention-global-4d" }
