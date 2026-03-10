@@ -564,6 +564,7 @@ class CorridorKeyService:
         skip_stems: set[str] | None = None,
         output_config: OutputConfig | None = None,
         frame_range: tuple[int, int] | None = None,
+        batch_size: int = 8,
     ) -> list[FrameResult]:
         """Run CorridorKey inference on a single clip.
 
@@ -575,6 +576,8 @@ class CorridorKeyService:
             on_warning: Called with warning messages for non-fatal issues.
             skip_stems: Set of frame stems to skip (for resume support).
             output_config: Which outputs to write and their formats.
+            batch_size: Frames per inference batch. Uses engine.process_batch()
+                when available, otherwise falls back to per-frame execution.
 
         Returns:
             List of FrameResult for each frame.
@@ -632,79 +635,134 @@ class CorridorKeyService:
             frame_indices = range(num_frames)
             range_count = num_frames
 
+        requested_batch = max(1, batch_size)
+        frame_list = list(frame_indices)
+        completed_progress = 0
+
         try:
-            for progress_i, i in enumerate(frame_indices):
-                # Check cancellation between frames
+            if on_progress:
+                on_progress(clip.name, 0, range_count)
+
+            process_batch = getattr(engine, "process_batch", None)
+            use_batched_engine = callable(process_batch)
+
+            offset = 0
+            while offset < len(frame_list):
                 if job and job.is_cancelled:
-                    raise JobCancelledError(clip.name, i)
+                    raise JobCancelledError(clip.name, frame_list[offset])
 
-                # Report progress every frame (enables responsive cancel + timer)
-                if on_progress:
-                    on_progress(clip.name, progress_i, range_count)
+                batch_images: list[np.ndarray] = []
+                batch_masks: list[np.ndarray] = []
+                batch_meta: list[tuple[int, str, bool]] = []
 
-                try:
-                    # Read input
-                    img, input_stem, is_linear = self._read_input_frame(
-                        clip,
-                        i,
-                        input_files,
-                        input_cap,
-                        params.input_is_linear,
-                    )
-                    if img is None:
+                while offset < len(frame_list) and len(batch_images) < requested_batch:
+                    i = frame_list[offset]
+                    offset += 1
+
+                    try:
+                        img, input_stem, is_linear = self._read_input_frame(
+                            clip,
+                            i,
+                            input_files,
+                            input_cap,
+                            params.input_is_linear,
+                        )
+                        if img is None:
+                            skipped.append(i)
+                            results.append(FrameResult(i, f"{i:05d}", False, "video read failed"))
+                            completed_progress += 1
+                            if on_progress:
+                                on_progress(clip.name, completed_progress, range_count)
+                            continue
+
+                        if input_stem in skip_stems:
+                            results.append(FrameResult(i, input_stem, True, "resumed (skipped)"))
+                            completed_progress += 1
+                            if on_progress:
+                                on_progress(clip.name, completed_progress, range_count)
+                            continue
+
+                        mask = self._read_alpha_frame(clip, i, alpha_files, alpha_cap)
+                        if mask is None:
+                            skipped.append(i)
+                            results.append(FrameResult(i, input_stem, False, "alpha read failed"))
+                            completed_progress += 1
+                            if on_progress:
+                                on_progress(clip.name, completed_progress, range_count)
+                            continue
+
+                        if mask.shape[:2] != img.shape[:2]:
+                            mask = cv2.resize(mask, (img.shape[1], img.shape[0]), interpolation=cv2.INTER_LINEAR)
+
+                        batch_images.append(img)
+                        batch_masks.append(mask)
+                        batch_meta.append((i, input_stem, is_linear))
+
+                    except FrameReadError as e:
+                        logger.warning(str(e))
                         skipped.append(i)
-                        results.append(FrameResult(i, f"{i:05d}", False, "video read failed"))
-                        continue
+                        results.append(FrameResult(i, f"{i:05d}", False, str(e)))
+                        completed_progress += 1
+                        if on_warning:
+                            on_warning(str(e))
+                        if on_progress:
+                            on_progress(clip.name, completed_progress, range_count)
 
-                    # Resume: skip frames that already have outputs
-                    if input_stem in skip_stems:
-                        results.append(FrameResult(i, input_stem, True, "resumed (skipped)"))
-                        continue
+                if not batch_images:
+                    continue
 
-                    # Read alpha
-                    mask = self._read_alpha_frame(clip, i, alpha_files, alpha_cap)
-                    if mask is None:
-                        skipped.append(i)
-                        results.append(FrameResult(i, input_stem, False, "alpha read failed"))
-                        continue
-
-                    # Resize mask if dimensions don't match input
-                    if mask.shape[:2] != img.shape[:2]:
-                        mask = cv2.resize(mask, (img.shape[1], img.shape[0]), interpolation=cv2.INTER_LINEAR)
-
-                    # Process (GPU-locked — process_frame mutates model hooks)
-                    t_frame = time.monotonic()
-                    with self._gpu_lock:
-                        res = engine.process_frame(
-                            img,
-                            mask,
-                            input_is_linear=is_linear,
+                t_batch = time.monotonic()
+                with self._gpu_lock:
+                    if use_batched_engine:
+                        batch_results = process_batch(
+                            batch_images,
+                            batch_masks,
+                            input_is_linear=params.input_is_linear,
                             fg_is_straight=True,
                             despill_strength=params.despill_strength,
                             auto_despeckle=params.auto_despeckle,
                             despeckle_size=params.despeckle_size,
                             refiner_scale=params.refiner_scale,
                         )
-                    logger.debug(f"Clip '{clip.name}' frame {i}: process_frame {time.monotonic() - t_frame:.3f}s")
+                    else:
+                        batch_results = [
+                            engine.process_frame(
+                                image,
+                                mask,
+                                input_is_linear=is_linear,
+                                fg_is_straight=True,
+                                despill_strength=params.despill_strength,
+                                auto_despeckle=params.auto_despeckle,
+                                despeckle_size=params.despeckle_size,
+                                refiner_scale=params.refiner_scale,
+                            )
+                            for image, mask, (_idx, _stem, is_linear) in zip(batch_images, batch_masks, batch_meta)
+                        ]
 
-                    # Write outputs
-                    self._write_outputs(res, dirs, input_stem, clip.name, i, cfg)
-                    results.append(FrameResult(i, input_stem, True))
+                logger.debug(
+                    f"Clip '{clip.name}': batch of {len(batch_images)} frame(s) in {time.monotonic() - t_batch:.3f}s"
+                )
 
-                except FrameReadError as e:
-                    logger.warning(str(e))
-                    skipped.append(i)
-                    results.append(FrameResult(i, f"{i:05d}", False, str(e)))
-                    if on_warning:
-                        on_warning(str(e))
+                if len(batch_results) != len(batch_meta):
+                    raise RuntimeError(
+                        f"Engine returned {len(batch_results)} results for a batch of {len(batch_meta)} frames"
+                    )
 
-                except WriteFailureError as e:
-                    logger.error(str(e))
-                    results.append(FrameResult(i, f"{i:05d}", False, str(e)))
-                    if on_warning:
-                        on_warning(str(e))
+                for res, (i, input_stem, _is_linear) in zip(batch_results, batch_meta):
+                    if job and job.is_cancelled:
+                        raise JobCancelledError(clip.name, i)
+                    try:
+                        self._write_outputs(res, dirs, input_stem, clip.name, i, cfg)
+                        results.append(FrameResult(i, input_stem, True))
+                    except WriteFailureError as e:
+                        logger.error(str(e))
+                        results.append(FrameResult(i, input_stem, False, str(e)))
+                        if on_warning:
+                            on_warning(str(e))
+                    completed_progress += 1
+                    if on_progress:
+                        on_progress(clip.name, completed_progress, range_count)
 
-            # Final progress
             if on_progress:
                 on_progress(clip.name, range_count, range_count)
 

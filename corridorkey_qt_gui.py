@@ -99,6 +99,8 @@ import numpy as np
 import torch
 
 from backend.clip_state import ClipEntry
+from backend.errors import JobCancelledError
+from backend.job_queue import GPUJob, JobType
 from backend.project import create_project, get_clip_dirs, is_image_file, is_video_file
 from backend.service import CorridorKeyService, InferenceParams, OutputConfig
 
@@ -533,50 +535,76 @@ class SegmentationModelManager:
         score_threshold: float,
     ) -> tuple[list[SegmentationCandidate], str]:
         with self._lock:
-            output = self._predict(frame_rgb, preferred_device)
+            outputs = self._predict_batch([frame_rgb], preferred_device)
 
-        scores = output["scores"].detach().cpu().numpy()
-        labels = output["labels"].detach().cpu().numpy()
-        boxes = output["boxes"].detach().cpu().numpy()
-        masks = output["masks"].detach().cpu().numpy()[:, 0]
+        candidates = self._outputs_to_candidates([frame_rgb], outputs, score_threshold)
+        return candidates[0], self._device
 
-        candidates: list[SegmentationCandidate] = []
-        height, width = frame_rgb.shape[:2]
-        for score, label_id, box_array, mask in zip(scores, labels, boxes, masks):
-            if float(score) < score_threshold:
-                continue
-            x1, y1, x2, y2 = [int(round(v)) for v in box_array.tolist()]
-            clipped_box = _clip_box((x1, y1, x2, y2), width, height)
-            label_index = int(label_id)
-            label_name = self._categories[label_index] if label_index < len(self._categories) else f"class_{label_id}"
-            candidates.append(
-                SegmentationCandidate(
-                    label_id=label_index,
-                    label_name=label_name,
-                    score=float(score),
-                    box=clipped_box,
-                    mask=mask.astype(np.float32),
-                )
-            )
+    def detect_candidates_batch(
+        self,
+        frames_rgb: list[np.ndarray],
+        preferred_device: str,
+        score_threshold: float,
+    ) -> tuple[list[list[SegmentationCandidate]], str]:
+        if not frames_rgb:
+            return [], self._device
 
-        candidates.sort(key=lambda item: item.score, reverse=True)
-        return candidates[:12], self._device
+        with self._lock:
+            outputs = self._predict_batch(frames_rgb, preferred_device)
 
-    def _predict(self, frame_rgb: np.ndarray, preferred_device: str):
+        return self._outputs_to_candidates(frames_rgb, outputs, score_threshold), self._device
+
+    def _predict_batch(self, frames_rgb: list[np.ndarray], preferred_device: str):
         if self._model is None:
             self._load_model(preferred_device)
 
-        tensor = torch.from_numpy(frame_rgb.transpose(2, 0, 1)).float().div(255.0).to(self._device)
+        tensors = [torch.from_numpy(frame.transpose(2, 0, 1)).float().div(255.0).to(self._device) for frame in frames_rgb]
         try:
             with torch.inference_mode():
-                return self._model([tensor])[0]
+                return self._model(tensors)
         except Exception:
             if self._device == "cpu":
                 raise
             self._load_model("cpu")
-            tensor = tensor.to("cpu")
+            tensors = [tensor.to("cpu") for tensor in tensors]
             with torch.inference_mode():
-                return self._model([tensor])[0]
+                return self._model(tensors)
+
+    def _outputs_to_candidates(
+        self,
+        frames_rgb: list[np.ndarray],
+        outputs: list[dict],
+        score_threshold: float,
+    ) -> list[list[SegmentationCandidate]]:
+        batches: list[list[SegmentationCandidate]] = []
+        for frame_rgb, output in zip(frames_rgb, outputs):
+            scores = output["scores"].detach().cpu().numpy()
+            labels = output["labels"].detach().cpu().numpy()
+            boxes = output["boxes"].detach().cpu().numpy()
+            masks = output["masks"].detach().cpu().numpy()[:, 0]
+
+            candidates: list[SegmentationCandidate] = []
+            height, width = frame_rgb.shape[:2]
+            for score, label_id, box_array, mask in zip(scores, labels, boxes, masks):
+                if float(score) < score_threshold:
+                    continue
+                x1, y1, x2, y2 = [int(round(v)) for v in box_array.tolist()]
+                clipped_box = _clip_box((x1, y1, x2, y2), width, height)
+                label_index = int(label_id)
+                label_name = self._categories[label_index] if label_index < len(self._categories) else f"class_{label_id}"
+                candidates.append(
+                    SegmentationCandidate(
+                        label_id=label_index,
+                        label_name=label_name,
+                        score=float(score),
+                        box=clipped_box,
+                        mask=mask.astype(np.float32),
+                    )
+                )
+
+            candidates.sort(key=lambda item: item.score, reverse=True)
+            batches.append(candidates[:12])
+        return batches
 
     def _load_model(self, preferred_device: str) -> None:
         from torchvision.models.detection import MaskRCNN_ResNet50_FPN_Weights, maskrcnn_resnet50_fpn
@@ -643,6 +671,7 @@ class GenerateMaskHintWorker(QThread):
     progress = Signal(int, int)
     preview = Signal(int, object, object)
     completed = Signal(str)
+    cancelled = Signal(str)
     failed = Signal(str)
 
     def __init__(
@@ -655,6 +684,7 @@ class GenerateMaskHintWorker(QThread):
         score_threshold: float,
         blur_size: int,
         erode_size: int,
+        batch_size: int,
     ):
         super().__init__()
         self._source_path = source_path
@@ -665,12 +695,20 @@ class GenerateMaskHintWorker(QThread):
         self._score_threshold = score_threshold
         self._blur_size = blur_size
         self._erode_size = erode_size
+        self._batch_size = max(1, batch_size)
+        self._cancel_requested = threading.Event()
+
+    def request_cancel(self) -> None:
+        self._cancel_requested.set()
 
     def run(self) -> None:
         alpha_dir = os.path.join(self._clip_root, "AlphaHint")
         cap = None
         try:
-            self.status.emit("Generating mask hints with Mask R-CNN...")
+            self.status.emit(
+                f"Generating mask hints with Mask R-CNN in batches of {self._batch_size}. "
+                "Press Esc or use Cancel to stop after the current batch."
+            )
             _clear_alpha_assets(self._clip_root)
             os.makedirs(alpha_dir, exist_ok=True)
 
@@ -687,69 +725,90 @@ class GenerateMaskHintWorker(QThread):
 
             frame_index = 0
             while True:
-                ok, frame_bgr = cap.read()
-                if not ok or frame_bgr is None:
+                self._check_cancel(frame_index)
+
+                batch_bgr: list[np.ndarray] = []
+                batch_rgb: list[np.ndarray] = []
+                for _ in range(self._batch_size):
+                    ok, frame_bgr = cap.read()
+                    if not ok or frame_bgr is None:
+                        break
+                    batch_bgr.append(frame_bgr)
+                    batch_rgb.append(cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB))
+
+                if not batch_bgr:
                     break
 
-                frame_rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
-                if frame_index == 0:
-                    chosen_masks = [selection.mask for selection in self._selections]
-                    for tracker, previous_box in zip(trackers, previous_boxes):
-                        if tracker is not None:
-                            tracker.init(frame_bgr, _xyxy_to_xywh(previous_box))
-                else:
-                    candidates, _device_name = self._manager.detect_candidates(
-                        frame_rgb,
+                detect_offset = 1 if frame_index == 0 else 0
+                candidate_batches: list[list[SegmentationCandidate]] = []
+                if len(batch_rgb) > detect_offset:
+                    candidate_batches, _device_name = self._manager.detect_candidates_batch(
+                        batch_rgb[detect_offset:],
                         self._preferred_device,
                         self._score_threshold,
                     )
-                    remaining_candidates = list(candidates)
-                    chosen_masks = []
 
-                    for idx, selection in enumerate(self._selections):
-                        tracked_box = None
-                        tracker = trackers[idx]
-                        if tracker is not None:
-                            tracker_ok, tracker_box = tracker.update(frame_bgr)
-                            if tracker_ok:
-                                tracked_box = _xywh_to_xyxy(tracker_box)
+                candidate_iter = iter(candidate_batches)
+                for local_idx, (frame_bgr, frame_rgb) in enumerate(zip(batch_bgr, batch_rgb)):
+                    current_index = frame_index + local_idx
+                    self._check_cancel(current_index)
 
-                        best = self._choose_candidate(
-                            selection,
-                            remaining_candidates,
-                            tracked_box or previous_boxes[idx],
-                        )
-
-                        if best is not None:
-                            chosen_masks.append(best.mask)
-                            previous_boxes[idx] = best.box
-                            if best in remaining_candidates:
-                                remaining_candidates.remove(best)
-                            tracker = _create_tracker()
-                            trackers[idx] = tracker
+                    if current_index == 0:
+                        chosen_masks = [selection.mask for selection in self._selections]
+                        for tracker, previous_box in zip(trackers, previous_boxes):
                             if tracker is not None:
-                                tracker.init(frame_bgr, _xyxy_to_xywh(previous_boxes[idx]))
-                        elif tracked_box is not None:
-                            previous_boxes[idx] = _clip_box(tracked_box, frame_rgb.shape[1], frame_rgb.shape[0])
-                            chosen_masks.append(_rectangle_mask(frame_rgb.shape[:2], previous_boxes[idx]))
-                        else:
-                            chosen_masks.append(np.zeros(frame_rgb.shape[:2], dtype=np.float32))
+                                tracker.init(frame_bgr, _xyxy_to_xywh(previous_box))
+                    else:
+                        remaining_candidates = list(next(candidate_iter, []))
+                        chosen_masks = []
 
-                chosen_mask = np.zeros(frame_rgb.shape[:2], dtype=np.float32)
-                for mask in chosen_masks:
-                    chosen_mask = np.maximum(chosen_mask, mask.astype(np.float32))
+                        for idx, selection in enumerate(self._selections):
+                            tracked_box = None
+                            tracker = trackers[idx]
+                            if tracker is not None:
+                                tracker_ok, tracker_box = tracker.update(frame_bgr)
+                                if tracker_ok:
+                                    tracked_box = _xywh_to_xyxy(tracker_box)
 
-                hint = _coarse_hint_from_mask(chosen_mask, self._blur_size, self._erode_size)
-                out_path = os.path.join(alpha_dir, f"frame_{frame_index:06d}.png")
-                cv2.imwrite(out_path, hint)
-                self.progress.emit(frame_index + 1, total_frames)
-                self.preview.emit(frame_index, frame_rgb, hint)
-                frame_index += 1
+                            best = self._choose_candidate(
+                                selection,
+                                remaining_candidates,
+                                tracked_box or previous_boxes[idx],
+                            )
+
+                            if best is not None:
+                                chosen_masks.append(best.mask)
+                                previous_boxes[idx] = best.box
+                                if best in remaining_candidates:
+                                    remaining_candidates.remove(best)
+                                tracker = _create_tracker()
+                                trackers[idx] = tracker
+                                if tracker is not None:
+                                    tracker.init(frame_bgr, _xyxy_to_xywh(previous_boxes[idx]))
+                            elif tracked_box is not None:
+                                previous_boxes[idx] = _clip_box(tracked_box, frame_rgb.shape[1], frame_rgb.shape[0])
+                                chosen_masks.append(_rectangle_mask(frame_rgb.shape[:2], previous_boxes[idx]))
+                            else:
+                                chosen_masks.append(np.zeros(frame_rgb.shape[:2], dtype=np.float32))
+
+                    chosen_mask = np.zeros(frame_rgb.shape[:2], dtype=np.float32)
+                    for mask in chosen_masks:
+                        chosen_mask = np.maximum(chosen_mask, mask.astype(np.float32))
+
+                    hint = _coarse_hint_from_mask(chosen_mask, self._blur_size, self._erode_size)
+                    out_path = os.path.join(alpha_dir, f"frame_{current_index:06d}.png")
+                    cv2.imwrite(out_path, hint)
+                    self.progress.emit(current_index + 1, total_frames)
+                    self.preview.emit(current_index, frame_rgb, hint)
+
+                frame_index += len(batch_bgr)
 
             if frame_index == 0:
                 raise RuntimeError("No frames were read from the source video")
 
             self.completed.emit(alpha_dir)
+        except JobCancelledError as exc:
+            self.cancelled.emit(str(exc))
         except Exception as exc:  # pragma: no cover - depends on local model/runtime
             self.failed.emit(str(exc))
         finally:
@@ -776,12 +835,17 @@ class GenerateMaskHintWorker(QThread):
         scored.sort(key=lambda item: item[0], reverse=True)
         return scored[0][1]
 
+    def _check_cancel(self, frame_index: int) -> None:
+        if self._cancel_requested.is_set():
+            raise JobCancelledError(Path(self._clip_root).name, frame_index)
+
 
 class ExportWorker(QThread):
     status = Signal(str)
     progress = Signal(int, int)
     preview = Signal(int, object)
     completed = Signal(str)
+    cancelled = Signal(str)
     failed = Signal(str)
 
     def __init__(
@@ -790,16 +854,25 @@ class ExportWorker(QThread):
         clip: ClipEntry,
         params: InferenceParams,
         output_config: OutputConfig,
+        batch_size: int,
     ):
         super().__init__()
         self._service = service
         self._clip = clip
         self._params = params
         self._output_config = output_config
+        self._batch_size = max(1, batch_size)
+        self._job = GPUJob(JobType.INFERENCE, clip.name)
+
+    def request_cancel(self) -> None:
+        self._job.request_cancel()
 
     def run(self) -> None:
         try:
-            self.status.emit("Exporting CorridorKey outputs...")
+            self.status.emit(
+                f"Exporting CorridorKey outputs in batches of {self._batch_size}. "
+                "Press Esc or use Cancel to stop after the current batch."
+            )
 
             def on_progress(_clip_name: str, current: int, total: int) -> None:
                 self.progress.emit(current, total)
@@ -819,10 +892,14 @@ class ExportWorker(QThread):
             self._service.run_inference(
                 self._clip,
                 self._params,
+                job=self._job,
                 on_progress=on_progress,
                 output_config=self._output_config,
+                batch_size=self._batch_size,
             )
             self.completed.emit(os.path.join(self._clip.root_path, "Output"))
+        except JobCancelledError as exc:
+            self.cancelled.emit(str(exc))
         except Exception as exc:  # pragma: no cover - depends on local engine/runtime
             self.failed.emit(str(exc))
 
@@ -855,8 +932,16 @@ class CorridorKeyWindow(QMainWindow):
         self._refresh_actions()
 
     def closeEvent(self, event) -> None:  # noqa: N802 - Qt API
+        self._cancel_active_job()
         self.service.unload_engines()
         super().closeEvent(event)
+
+    def keyPressEvent(self, event) -> None:  # noqa: N802 - Qt API
+        if event.key() == Qt.Key_Escape and self._has_cancelable_job():
+            self._cancel_active_job()
+            event.accept()
+            return
+        super().keyPressEvent(event)
 
     def _build_ui(self) -> None:
         root = QWidget()
@@ -961,11 +1046,16 @@ class CorridorKeyWindow(QMainWindow):
         self.refiner_spin.setDecimals(2)
         self.refiner_spin.setValue(1.0)
 
+        self.batch_size_spin = QSpinBox()
+        self.batch_size_spin.setRange(1, 64)
+        self.batch_size_spin.setValue(8)
+
         inference_layout.addRow("Input gamma", self.gamma_combo)
         inference_layout.addRow("Despill (0-10)", self.despill_spin)
         inference_layout.addRow(self.auto_despeckle_check)
         inference_layout.addRow("Despeckle size", self.despeckle_size_spin)
         inference_layout.addRow("Refiner scale", self.refiner_spin)
+        inference_layout.addRow("Batch size", self.batch_size_spin)
         layout.addWidget(inference_group)
 
         export_group = QGroupBox("Export")
@@ -974,17 +1064,25 @@ class CorridorKeyWindow(QMainWindow):
         self.export_mode_combo.addItems(["Preview PNG", "Matte + Preview", "Full Package"])
         self.export_button = QPushButton("Export")
         self.export_button.clicked.connect(self._export_outputs)
+        self.cancel_button = QPushButton("Cancel (Esc)")
+        self.cancel_button.clicked.connect(self._cancel_active_job)
+        self.cancel_button.setEnabled(False)
+        action_row = QWidget()
+        action_layout = QHBoxLayout(action_row)
+        action_layout.setContentsMargins(0, 0, 0, 0)
+        action_layout.addWidget(self.export_button)
+        action_layout.addWidget(self.cancel_button)
         self.progress_bar = QProgressBar()
         self.progress_bar.setRange(0, 100)
         self.progress_bar.setValue(0)
         self.progress_label = QLabel("0 / 0")
         export_layout.addRow("Export mode", self.export_mode_combo)
-        export_layout.addRow(self.export_button)
+        export_layout.addRow(action_row)
         export_layout.addRow(self.progress_bar)
         export_layout.addRow(self.progress_label)
         layout.addWidget(export_group)
 
-        self.status_label = QLabel("Load a source video to begin.")
+        self.status_label = QLabel("Load a source video to begin. Hold Shift to multi-select objects. Press Esc to cancel long jobs.")
         self.status_label.setWordWrap(True)
         layout.addWidget(self.status_label)
 
@@ -1229,11 +1327,13 @@ class CorridorKeyWindow(QMainWindow):
             score_threshold=self.score_spin.value(),
             blur_size=self.blur_spin.value(),
             erode_size=self.erode_spin.value(),
+            batch_size=self.batch_size_spin.value(),
         )
         self.mask_worker.status.connect(self._set_status)
         self.mask_worker.progress.connect(self._set_progress)
         self.mask_worker.preview.connect(self._on_mask_preview)
         self.mask_worker.completed.connect(self._on_mask_generation_completed)
+        self.mask_worker.cancelled.connect(self._on_worker_cancelled)
         self.mask_worker.failed.connect(self._show_error)
         self.mask_worker.finished.connect(self._on_worker_finished)
         self.mask_worker.start()
@@ -1279,11 +1379,13 @@ class CorridorKeyWindow(QMainWindow):
             clip=self.clip,
             params=params,
             output_config=output_config,
+            batch_size=self.batch_size_spin.value(),
         )
         self.export_worker.status.connect(self._set_status)
         self.export_worker.progress.connect(self._set_progress)
         self.export_worker.preview.connect(self._on_export_preview)
         self.export_worker.completed.connect(self._on_export_completed)
+        self.export_worker.cancelled.connect(self._on_worker_cancelled)
         self.export_worker.failed.connect(self._show_error)
         self.export_worker.finished.connect(self._on_worker_finished)
         self.export_worker.start()
@@ -1313,6 +1415,10 @@ class CorridorKeyWindow(QMainWindow):
         self.mask_worker = None
         self.export_worker = None
         self._refresh_actions()
+
+    def _on_worker_cancelled(self, message: str) -> None:
+        self._log(f"CANCELLED: {message}")
+        self.status_label.setText(message)
 
     def _configure_slider(self, frame_count: int) -> None:
         enabled = frame_count > 0
@@ -1365,11 +1471,13 @@ class CorridorKeyWindow(QMainWindow):
         self.detect_button.setEnabled(has_source and not busy)
         self.generate_button.setEnabled(has_source and has_selection and not busy)
         self.export_button.setEnabled(has_source and has_alpha and not busy)
+        self.cancel_button.setEnabled(self._has_cancelable_job())
         self.frame_slider.setEnabled(has_source and not busy)
         self.source_edit.setEnabled(not busy)
         self.alpha_edit.setEnabled(not busy)
         self.source_browse_button.setEnabled(not busy)
         self.alpha_browse_button.setEnabled(not busy)
+        self.batch_size_spin.setEnabled(not busy)
 
     def _set_busy(self, busy: bool) -> None:
         if busy:
@@ -1404,6 +1512,22 @@ class CorridorKeyWindow(QMainWindow):
         if not message:
             return
         self.log_view.appendPlainText(message)
+
+    def _is_busy(self) -> bool:
+        return self.detect_worker is not None or self.mask_worker is not None or self.export_worker is not None
+
+    def _has_cancelable_job(self) -> bool:
+        return self.mask_worker is not None or self.export_worker is not None
+
+    def _cancel_active_job(self) -> None:
+        if self.mask_worker is not None:
+            self.mask_worker.request_cancel()
+            self._set_status("Cancelling mask hint generation after the current batch...")
+            return
+        if self.export_worker is not None:
+            self.export_worker.request_cancel()
+            self._set_status("Cancelling export after the current batch...")
+            return
 
 
 def main() -> int:
