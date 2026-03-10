@@ -46,6 +46,7 @@ dependencies = [
 [dependency-groups]
 dev = ["pytest", "pytest-cov", "ruff"]
 docs = ["zensical>=0.0.24"]
+gui = ["PySide6>=6.7"]
 
 [project.scripts]
 corridorkey = "corridorkey_cli:main"
