@@ -121,7 +121,9 @@ from backend.errors import JobCancelledError
 from backend.job_queue import GPUJob, JobType
 from backend.project import create_project, get_clip_dirs, is_image_file, is_video_file
 from backend.sam2_runtime import (
+    Sam2PrefetchedBatch,
     apply_torch_inference_optimizations,
+    iter_prefetched_batches,
     merge_sam2_masks,
     sam2_preprocess_batch_size,
     sam2_session_devices,
@@ -188,6 +190,7 @@ _SAM2_VARIANTS = {
 _DEFAULT_SAM2_VARIANT = "SAM2 Tiny (fast)"
 _FAST_PNG_WRITE_PARAMS = [cv2.IMWRITE_PNG_COMPRESSION, 1]
 _QT_SPINBOX_MAX = 2_147_483_647
+_SAM2_PREFETCH_DEPTH = 2
 
 
 @dataclass
@@ -708,12 +711,15 @@ class SegmentationModelManager:
                 dtype=self._dtype,
             )
 
-            frame_index = 0
-            while True:
+            next_batch_frame_index = 0
+
+            def _load_next_batch() -> Sam2PrefetchedBatch | None:
+                nonlocal next_batch_frame_index
+
                 frame_batch_rgb: list[np.ndarray] = []
                 while len(frame_batch_rgb) < preprocess_batch_size:
                     if cancel_event.is_set():
-                        raise JobCancelledError(Path(clip_root).name, frame_index)
+                        raise JobCancelledError(Path(clip_root).name, next_batch_frame_index)
 
                     ok, frame_bgr = cap.read()
                     if not ok or frame_bgr is None:
@@ -721,12 +727,27 @@ class SegmentationModelManager:
                     frame_batch_rgb.append(cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB))
 
                 if not frame_batch_rgb:
-                    break
+                    return None
 
+                start_frame_index = next_batch_frame_index
+                next_batch_frame_index += len(frame_batch_rgb)
                 frame_inputs = self._video_processor(images=frame_batch_rgb, return_tensors="pt")
                 model_inputs = self._move_inputs_to_device(frame_inputs, pixel_dtype=self._dtype)
-                pixel_values_batch = model_inputs["pixel_values"]
-                original_sizes = frame_inputs["original_sizes"]
+                return Sam2PrefetchedBatch(
+                    start_frame_index=start_frame_index,
+                    frame_batch_rgb=frame_batch_rgb,
+                    pixel_values_batch=model_inputs["pixel_values"],
+                    original_sizes=frame_inputs["original_sizes"],
+                )
+
+            for batch in iter_prefetched_batches(_load_next_batch, prefetch_count=_SAM2_PREFETCH_DEPTH):
+                if cancel_event.is_set():
+                    raise JobCancelledError(Path(clip_root).name, batch.start_frame_index)
+
+                frame_index = batch.start_frame_index
+                frame_batch_rgb = batch.frame_batch_rgb
+                pixel_values_batch = batch.pixel_values_batch
+                original_sizes = batch.original_sizes
 
                 if frame_index == 0:
                     self._video_processor.add_inputs_to_inference_session(
@@ -764,9 +785,7 @@ class SegmentationModelManager:
                     cv2.imwrite(out_path, hint, _FAST_PNG_WRITE_PARAMS)
                     on_frame(current_frame_index, total_frames, frame_rgb, hint)
 
-                frame_index += len(frame_batch_rgb)
-
-            if frame_index == 0:
+            if next_batch_frame_index == 0:
                 raise RuntimeError("No frames were read from the source video")
             return alpha_dir
         finally:
