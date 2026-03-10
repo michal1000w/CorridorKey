@@ -30,11 +30,11 @@ def test_sam2_session_devices_fall_back_to_cpu():
     }
 
 
-def test_sam2_preprocess_batch_size_is_capped_by_device():
-    assert sam2_preprocess_batch_size("mps", 64) == 8
-    assert sam2_preprocess_batch_size("cuda", 64) == 16
-    assert sam2_preprocess_batch_size("cpu", 64) == 1
-    assert sam2_preprocess_batch_size("mps", 3) == 3
+def test_sam2_preprocess_batch_size_uses_user_value():
+    assert sam2_preprocess_batch_size("mps", 64) == 64
+    assert sam2_preprocess_batch_size("cuda", 256) == 256
+    assert sam2_preprocess_batch_size("cpu", 64) == 64
+    assert sam2_preprocess_batch_size("mps", 0) == 1
 
 
 def test_merge_sam2_masks_merges_tensor_batch():

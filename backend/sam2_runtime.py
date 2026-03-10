@@ -42,12 +42,9 @@ def sam2_session_devices(device_name: str) -> dict[str, str]:
 
 
 def sam2_preprocess_batch_size(device_name: str, cache_size: int) -> int:
-    """Cap preprocessing batches to something fast without exploding memory."""
-    batch_cap = {
-        "cuda": 16,
-        "mps": 8,
-    }.get(device_name, 1)
-    return max(1, min(cache_size, batch_cap))
+    """Return the user-requested preprocessing batch size."""
+    del device_name
+    return max(1, cache_size)
 
 
 def merge_sam2_masks(object_masks: torch.Tensor | np.ndarray | list[torch.Tensor] | list[np.ndarray]) -> np.ndarray:

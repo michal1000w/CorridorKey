@@ -187,6 +187,7 @@ _SAM2_VARIANTS = {
 }
 _DEFAULT_SAM2_VARIANT = "SAM2 Tiny (fast)"
 _FAST_PNG_WRITE_PARAMS = [cv2.IMWRITE_PNG_COMPRESSION, 1]
+_QT_SPINBOX_MAX = 2_147_483_647
 
 
 @dataclass
@@ -1006,7 +1007,7 @@ class GenerateMaskHintWorker(QThread):
         try:
             self.status.emit(
                 f"Generating mask hints with {self._model_variant} video propagation. "
-                f"Cache window: {self._batch_size} frames. Press Esc or use Cancel to stop."
+                f"Batch/cache window: {self._batch_size} frames. Press Esc or use Cancel to stop."
             )
             alpha_dir, runtime_label = self._manager.generate_mask_hint(
                 source_path=self._source_path,
@@ -1210,6 +1211,10 @@ class CorridorKeyWindow(QMainWindow):
         self.erode_spin.setRange(0, 31)
         self.erode_spin.setValue(5)
 
+        self.alpha_hint_batch_size_spin = QSpinBox()
+        self.alpha_hint_batch_size_spin.setRange(1, _QT_SPINBOX_MAX)
+        self.alpha_hint_batch_size_spin.setValue(16)
+
         self.clear_objects_button = QPushButton("Clear Objects")
         self.clear_objects_button.clicked.connect(self._clear_segmented_objects)
         self.generate_button = QPushButton("Generate Mask Hint")
@@ -1218,6 +1223,7 @@ class CorridorKeyWindow(QMainWindow):
         segment_layout.addRow("SAM2 model", self.sam2_model_combo)
         segment_layout.addRow("Blur size", self.blur_spin)
         segment_layout.addRow("Erode size", self.erode_spin)
+        segment_layout.addRow("Alpha hint batch", self.alpha_hint_batch_size_spin)
         segment_layout.addRow(self.clear_objects_button)
         segment_layout.addRow(self.generate_button)
         layout.addWidget(segment_group)
@@ -1253,7 +1259,7 @@ class CorridorKeyWindow(QMainWindow):
         inference_layout.addRow(self.auto_despeckle_check)
         inference_layout.addRow("Despeckle size", self.despeckle_size_spin)
         inference_layout.addRow("Refiner scale", self.refiner_spin)
-        inference_layout.addRow("Batch / cache size", self.batch_size_spin)
+        inference_layout.addRow("Export batch size", self.batch_size_spin)
         layout.addWidget(inference_group)
 
         export_group = QGroupBox("Export")
@@ -1573,7 +1579,7 @@ class CorridorKeyWindow(QMainWindow):
             f"sam2_model={self.sam2_model_combo.currentText()}, "
             f"blur={self.blur_spin.value()}, "
             f"erode={self.erode_spin.value()}, "
-            f"cache={self.batch_size_spin.value()}"
+            f"alpha_hint_batch={self.alpha_hint_batch_size_spin.value()}"
         )
         self.mask_worker = GenerateMaskHintWorker(
             source_path=self.clip.input_asset.path,
@@ -1584,7 +1590,7 @@ class CorridorKeyWindow(QMainWindow):
             model_variant=self.sam2_model_combo.currentText(),
             blur_size=self.blur_spin.value(),
             erode_size=self.erode_spin.value(),
-            batch_size=self.batch_size_spin.value(),
+            batch_size=self.alpha_hint_batch_size_spin.value(),
         )
         self.mask_worker.status.connect(self._set_status)
         self.mask_worker.progress.connect(self._set_progress)
@@ -1749,6 +1755,7 @@ class CorridorKeyWindow(QMainWindow):
         self.alpha_edit.setEnabled(not busy)
         self.source_browse_button.setEnabled(not busy)
         self.alpha_browse_button.setEnabled(not busy)
+        self.alpha_hint_batch_size_spin.setEnabled(not busy)
         self.batch_size_spin.setEnabled(not busy)
         self.sam2_model_combo.setEnabled(not busy)
 
