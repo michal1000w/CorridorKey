@@ -1,3 +1,9 @@
+'''
+GUI v1
+author: Michal Wieczorek
+nick: michal1000w
+email: michal_wieczorek@hotmail.com
+'''
 from __future__ import annotations
 
 import os
