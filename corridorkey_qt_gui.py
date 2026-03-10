@@ -120,6 +120,12 @@ from backend.clip_state import ClipEntry
 from backend.errors import JobCancelledError
 from backend.job_queue import GPUJob, JobType
 from backend.project import create_project, get_clip_dirs, is_image_file, is_video_file
+from backend.sam2_runtime import (
+    apply_torch_inference_optimizations,
+    merge_sam2_masks,
+    sam2_preprocess_batch_size,
+    sam2_session_devices,
+)
 from backend.service import CorridorKeyService, InferenceParams, OutputConfig
 
 try:
@@ -180,6 +186,7 @@ _SAM2_VARIANTS = {
     },
 }
 _DEFAULT_SAM2_VARIANT = "SAM2 Tiny (fast)"
+_FAST_PNG_WRITE_PARAMS = [cv2.IMWRITE_PNG_COMPRESSION, 1]
 
 
 @dataclass
@@ -678,6 +685,7 @@ class SegmentationModelManager:
         force_device: str | None = None,
     ) -> str:
         self._ensure_video_runtime(preferred_device, model_variant, force_device=force_device)
+        preprocess_batch_size = sam2_preprocess_batch_size(self._device, cache_size)
 
         alpha_dir = os.path.join(clip_root, "AlphaHint")
         _clear_alpha_assets(clip_root)
@@ -689,27 +697,35 @@ class SegmentationModelManager:
 
         total_frames = max(0, int(cap.get(cv2.CAP_PROP_FRAME_COUNT)))
         try:
+            session_devices = sam2_session_devices(self._device)
             session = self._video_processor.init_video_session(
-                inference_device=self._device,
-                inference_state_device="cpu",
-                processing_device="cpu",
-                video_storage_device="cpu",
+                inference_device=session_devices["inference_device"],
+                inference_state_device=session_devices["inference_state_device"],
+                processing_device=session_devices["processing_device"],
+                video_storage_device=session_devices["video_storage_device"],
                 max_vision_features_cache_size=max(1, cache_size),
                 dtype=self._dtype,
             )
 
             frame_index = 0
             while True:
-                if cancel_event.is_set():
-                    raise JobCancelledError(Path(clip_root).name, frame_index)
+                frame_batch_rgb: list[np.ndarray] = []
+                while len(frame_batch_rgb) < preprocess_batch_size:
+                    if cancel_event.is_set():
+                        raise JobCancelledError(Path(clip_root).name, frame_index)
 
-                ok, frame_bgr = cap.read()
-                if not ok or frame_bgr is None:
+                    ok, frame_bgr = cap.read()
+                    if not ok or frame_bgr is None:
+                        break
+                    frame_batch_rgb.append(cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB))
+
+                if not frame_batch_rgb:
                     break
 
-                frame_rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
-                frame_inputs = self._video_processor(images=frame_rgb, return_tensors="pt")
-                pixel_values = frame_inputs["pixel_values"]
+                frame_inputs = self._video_processor(images=frame_batch_rgb, return_tensors="pt")
+                model_inputs = self._move_inputs_to_device(frame_inputs, pixel_dtype=self._dtype)
+                pixel_values_batch = model_inputs["pixel_values"]
+                original_sizes = frame_inputs["original_sizes"]
 
                 if frame_index == 0:
                     self._video_processor.add_inputs_to_inference_session(
@@ -719,24 +735,35 @@ class SegmentationModelManager:
                         input_masks=[candidate.mask >= 0.5 for candidate in selections],
                     )
 
+                pred_masks_batch: list[torch.Tensor] = []
                 with torch.inference_mode():
-                    outputs = self._video_model(session, frame_idx=frame_index, frame=pixel_values)
+                    for batch_offset in range(len(frame_batch_rgb)):
+                        current_frame_index = frame_index + batch_offset
+                        outputs = self._video_model(
+                            session,
+                            frame_idx=current_frame_index,
+                            frame=pixel_values_batch[batch_offset : batch_offset + 1],
+                        )
+                        pred_masks_batch.append(outputs.pred_masks)
+                        self._trim_processed_frames(session, current_frame_index, max(2, cache_size))
 
                 processed_masks = self._video_processor.post_process_masks(
-                    [outputs.pred_masks],
-                    frame_inputs["original_sizes"],
+                    pred_masks_batch,
+                    original_sizes,
                     binarize=True,
                 )
-                merged_mask = np.zeros(frame_rgb.shape[:2], dtype=np.float32)
-                for object_masks in processed_masks[0]:
-                    merged_mask = np.maximum(merged_mask, object_masks[0].detach().cpu().numpy().astype(np.float32))
 
-                hint = _coarse_hint_from_mask(merged_mask, blur_size, erode_size)
-                out_path = os.path.join(alpha_dir, f"frame_{frame_index:06d}.png")
-                cv2.imwrite(out_path, hint)
-                on_frame(frame_index, total_frames, frame_rgb, hint)
-                self._trim_processed_frames(session, frame_index, max(2, cache_size))
-                frame_index += 1
+                for batch_offset, (frame_rgb, object_masks) in enumerate(
+                    zip(frame_batch_rgb, processed_masks, strict=True)
+                ):
+                    current_frame_index = frame_index + batch_offset
+                    merged_mask = merge_sam2_masks(object_masks)
+                    hint = _coarse_hint_from_mask(merged_mask, blur_size, erode_size)
+                    out_path = os.path.join(alpha_dir, f"frame_{current_frame_index:06d}.png")
+                    cv2.imwrite(out_path, hint, _FAST_PNG_WRITE_PARAMS)
+                    on_frame(current_frame_index, total_frames, frame_rgb, hint)
+
+                frame_index += len(frame_batch_rgb)
 
             if frame_index == 0:
                 raise RuntimeError("No frames were read from the source video")
@@ -810,6 +837,7 @@ class SegmentationModelManager:
                 try:
                     model = model_cls.from_pretrained(repo_id, torch_dtype=dtype)
                     model.eval()
+                    apply_torch_inference_optimizations(device_name)
                     model.to(device_name)
                     self._repo_id = repo_id
                     self._device = device_name
@@ -968,6 +996,7 @@ class GenerateMaskHintWorker(QThread):
         self._blur_size = blur_size
         self._erode_size = erode_size
         self._batch_size = max(1, batch_size)
+        self._preview_stride = max(1, min(4, self._batch_size))
         self._cancel_requested = threading.Event()
 
     def request_cancel(self) -> None:
@@ -1001,7 +1030,8 @@ class GenerateMaskHintWorker(QThread):
     def _on_frame_processed(self, frame_index: int, total_frames: int, frame_rgb: np.ndarray, hint: np.ndarray) -> None:
         self._check_cancel(frame_index)
         self.progress.emit(frame_index + 1, total_frames)
-        self.preview.emit(frame_index, frame_rgb, hint)
+        if frame_index == 0 or frame_index + 1 >= total_frames or ((frame_index + 1) % self._preview_stride) == 0:
+            self.preview.emit(frame_index, frame_rgb, hint)
 
     def _check_cancel(self, frame_index: int) -> None:
         if self._cancel_requested.is_set():
