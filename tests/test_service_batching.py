@@ -25,6 +25,8 @@ def test_service_run_inference_uses_process_batch(tmp_clip_dir):
     mock_engine = MagicMock()
     mock_engine.prepare_batch = None
     mock_engine.process_prepared_batch = None
+    mock_engine.run_prepared_batch_raw = None
+    mock_engine.finalize_raw_batch = None
     mock_engine.process_batch.return_value = [_fake_result(), _fake_result()]
     service._get_engine = lambda: mock_engine  # type: ignore[method-assign]
 
@@ -79,6 +81,8 @@ def test_service_run_inference_uses_prepared_batch_when_available(tmp_clip_dir):
     mock_engine = MagicMock()
     mock_engine.prepare_batch.return_value = "prepared-batch"
     mock_engine.process_prepared_batch.return_value = [_fake_result(), _fake_result()]
+    mock_engine.run_prepared_batch_raw = None
+    mock_engine.finalize_raw_batch = None
     service._get_engine = lambda: mock_engine  # type: ignore[method-assign]
 
     results = service.run_inference(
@@ -92,3 +96,34 @@ def test_service_run_inference_uses_prepared_batch_when_available(tmp_clip_dir):
     mock_engine.prepare_batch.assert_called_once()
     mock_engine.process_prepared_batch.assert_called_once_with("prepared-batch")
     mock_engine.process_batch.assert_not_called()
+
+
+def test_service_run_inference_prefers_raw_prepared_batch_pipeline(tmp_clip_dir):
+    entry = ClipEntry("shot_a", str(tmp_clip_dir / "shot_a"))
+    entry.find_assets()
+
+    service = CorridorKeyService()
+    mock_engine = MagicMock()
+    mock_engine.prepare_batch.return_value = "prepared-batch"
+    mock_engine.run_prepared_batch_raw.return_value = "raw-batch"
+    mock_engine.finalize_raw_batch.return_value = [_fake_result(), _fake_result()]
+    mock_engine.process_prepared_batch.return_value = [_fake_result(), _fake_result()]
+    mock_engine.process_batch = None
+    service._get_engine = lambda: mock_engine  # type: ignore[method-assign]
+
+    previews: list[tuple[int, np.ndarray]] = []
+    results = service.run_inference(
+        entry,
+        InferenceParams(),
+        output_config=OutputConfig(),
+        batch_size=8,
+        on_preview=lambda frame_index, comp_rgb: previews.append((frame_index, comp_rgb.copy())),
+    )
+
+    assert len(results) == 2
+    mock_engine.prepare_batch.assert_called_once()
+    mock_engine.run_prepared_batch_raw.assert_called_once_with("prepared-batch")
+    mock_engine.finalize_raw_batch.assert_called_once_with("raw-batch", "prepared-batch")
+    mock_engine.process_prepared_batch.assert_not_called()
+    assert [frame_index for frame_index, _preview in previews] == [0, 1]
+    assert all(preview.dtype == np.uint8 for _frame_index, preview in previews)

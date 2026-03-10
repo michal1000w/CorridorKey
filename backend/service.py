@@ -16,6 +16,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+from queue import Full, Queue
 import sys
 import threading
 import time
@@ -60,6 +61,8 @@ from .validators import (
 
 logger = logging.getLogger(__name__)
 _EXPORT_PREFETCH_DEPTH = 4
+_ASYNC_WRITE_QUEUE_DEPTH = 2
+_ASYNC_WRITE_SENTINEL = object()
 
 # Project paths — frozen-build aware
 if getattr(sys, "frozen", False):
@@ -152,6 +155,153 @@ class _PrefetchedInferenceBatch:
     prepared_batch: Any | None
     early_results: list[FrameResult]
     early_warnings: list[str]
+
+
+@dataclass
+class _PendingExportBatch:
+    """A batch waiting for CPU-side finalization, preview emission, and disk writes."""
+
+    batch_meta: list[tuple[int, str, bool]]
+    early_results: list[FrameResult]
+    early_warnings: list[str]
+    batch_results: list[dict[str, np.ndarray]] | None = None
+    raw_batch: Any | None = None
+    finalize_raw_batch: Callable[[Any], list[dict[str, np.ndarray]]] | None = None
+
+
+class _AsyncExportWriter:
+    """Move finalization, preview generation, and writes off the compute thread."""
+
+    def __init__(
+        self,
+        service: "CorridorKeyService",
+        clip_name: str,
+        dirs: dict[str, str],
+        output_config: OutputConfig,
+        total_frames: int,
+        on_progress: Callable[[str, int, int], None] | None = None,
+        on_warning: Callable[[str], None] | None = None,
+        on_preview: Callable[[int, np.ndarray], None] | None = None,
+        preview_stride: int = 1,
+    ):
+        self._service = service
+        self._clip_name = clip_name
+        self._dirs = dirs
+        self._output_config = output_config
+        self._total_frames = total_frames
+        self._on_progress = on_progress
+        self._on_warning = on_warning
+        self._on_preview = on_preview
+        self._preview_stride = max(1, preview_stride)
+        self._queue: Queue[object] = Queue(maxsize=_ASYNC_WRITE_QUEUE_DEPTH)
+        self._results: list[FrameResult] = []
+        self._completed = 0
+        self._closed = False
+        self._failure: BaseException | None = None
+        self._worker = threading.Thread(target=self._run, name="export-writer", daemon=True)
+        self._worker.start()
+
+    @property
+    def closed(self) -> bool:
+        return self._closed
+
+    def _raise_if_failed(self) -> None:
+        if self._failure is not None:
+            raise RuntimeError("Asynchronous export writer failed") from self._failure
+
+    def raise_if_failed(self) -> None:
+        self._raise_if_failed()
+
+    def submit(self, task: _PendingExportBatch) -> None:
+        if self._closed:
+            raise RuntimeError("Cannot submit work to a closed export writer")
+        self._raise_if_failed()
+        while True:
+            try:
+                self._queue.put(task, timeout=0.05)
+                return
+            except Full:
+                self._raise_if_failed()
+
+    def close(self) -> list[FrameResult]:
+        if self._closed:
+            self._raise_if_failed()
+            return list(self._results)
+
+        while True:
+            try:
+                self._queue.put(_ASYNC_WRITE_SENTINEL, timeout=0.05)
+                break
+            except Full:
+                self._raise_if_failed()
+
+        self._worker.join()
+        self._closed = True
+        self._raise_if_failed()
+        return list(self._results)
+
+    def _emit_warning(self, message: str) -> None:
+        if self._on_warning is not None:
+            self._on_warning(message)
+
+    def _emit_progress(self) -> None:
+        if self._on_progress is not None:
+            self._on_progress(self._clip_name, self._completed, self._total_frames)
+
+    def _emit_preview(self, frame_index: int, comp_rgb: np.ndarray) -> None:
+        if self._on_preview is None:
+            return
+        if frame_index != 0 and frame_index + 1 < self._total_frames and ((frame_index + 1) % self._preview_stride) != 0:
+            return
+        preview_rgb = comp_rgb
+        if preview_rgb.dtype != np.uint8:
+            preview_rgb = (np.clip(preview_rgb, 0.0, 1.0) * 255.0).astype(np.uint8)
+        self._on_preview(frame_index, preview_rgb)
+
+    def _process_task(self, task: _PendingExportBatch) -> None:
+        for warning in task.early_warnings:
+            self._emit_warning(warning)
+
+        for early_result in task.early_results:
+            self._results.append(early_result)
+            self._completed += 1
+            self._emit_progress()
+
+        if not task.batch_meta:
+            return
+
+        batch_results = task.batch_results
+        if batch_results is None:
+            if task.raw_batch is None or task.finalize_raw_batch is None:
+                raise RuntimeError("Export task is missing both finalized results and raw-batch finalizer")
+            batch_results = task.finalize_raw_batch(task.raw_batch)
+
+        if len(batch_results) != len(task.batch_meta):
+            raise RuntimeError(
+                f"Writer received {len(batch_results)} results for a batch of {len(task.batch_meta)} frames"
+            )
+
+        for res, (frame_index, input_stem, _is_linear) in zip(batch_results, task.batch_meta, strict=True):
+            try:
+                self._service._write_outputs(res, self._dirs, input_stem, self._clip_name, frame_index, self._output_config)
+                self._results.append(FrameResult(frame_index, input_stem, True))
+                self._emit_preview(frame_index, res["comp"])
+            except WriteFailureError as exc:
+                logger.error(str(exc))
+                self._results.append(FrameResult(frame_index, input_stem, False, str(exc)))
+                self._emit_warning(str(exc))
+            self._completed += 1
+            self._emit_progress()
+
+    def _run(self) -> None:
+        try:
+            while True:
+                task = self._queue.get()
+                if task is _ASYNC_WRITE_SENTINEL:
+                    return
+                self._process_task(task)
+        except BaseException as exc:
+            self._failure = exc
 
 
 class CorridorKeyService:
@@ -561,10 +711,12 @@ class CorridorKeyService:
         job: GPUJob | None = None,
         on_progress: Callable[[str, int, int], None] | None = None,
         on_warning: Callable[[str], None] | None = None,
+        on_preview: Callable[[int, np.ndarray], None] | None = None,
         skip_stems: set[str] | None = None,
         output_config: OutputConfig | None = None,
         frame_range: tuple[int, int] | None = None,
         batch_size: int = 8,
+        preview_stride: int = 1,
     ) -> list[FrameResult]:
         """Run CorridorKey inference on a single clip.
 
@@ -574,10 +726,12 @@ class CorridorKeyService:
             job: Optional GPUJob for cancel checking.
             on_progress: Called with (clip_name, current_frame, total_frames).
             on_warning: Called with warning messages for non-fatal issues.
+            on_preview: Called with (frame_index, comp_rgb_uint8) for lightweight UI previews.
             skip_stems: Set of frame stems to skip (for resume support).
             output_config: Which outputs to write and their formats.
             batch_size: Frames per inference batch. Uses engine.process_batch()
                 when available, otherwise falls back to per-frame execution.
+            preview_stride: Emit preview every N written frames (plus first/last).
 
         Returns:
             List of FrameResult for each frame.
@@ -637,7 +791,17 @@ class CorridorKeyService:
 
         requested_batch = max(1, batch_size)
         frame_list = list(frame_indices)
-        completed_progress = 0
+        writer = _AsyncExportWriter(
+            self,
+            clip.name,
+            dirs,
+            cfg,
+            range_count,
+            on_progress=on_progress,
+            on_warning=on_warning,
+            on_preview=on_preview,
+            preview_stride=preview_stride,
+        )
 
         try:
             if on_progress:
@@ -646,7 +810,16 @@ class CorridorKeyService:
             prepare_batch = getattr(engine, "prepare_batch", None)
             process_batch = getattr(engine, "process_batch", None)
             process_prepared_batch = getattr(engine, "process_prepared_batch", None)
-            use_prepared_engine = callable(prepare_batch) and callable(process_prepared_batch)
+            run_prepared_batch_raw = getattr(engine, "run_prepared_batch_raw", None)
+            finalize_raw_batch = getattr(engine, "finalize_raw_batch", None)
+            use_raw_prepared_engine = (
+                callable(prepare_batch)
+                and callable(run_prepared_batch_raw)
+                and callable(finalize_raw_batch)
+            )
+            use_prepared_engine = callable(prepare_batch) and (
+                callable(process_prepared_batch) or use_raw_prepared_engine
+            )
             use_batched_engine = callable(process_batch)
 
             offset = 0
@@ -734,15 +907,7 @@ class CorridorKeyService:
                 _load_next_inference_batch,
                 prefetch_count=_EXPORT_PREFETCH_DEPTH,
             ):
-                for warning in prefetched_batch.early_warnings:
-                    if on_warning:
-                        on_warning(warning)
-
-                for early_result in prefetched_batch.early_results:
-                    results.append(early_result)
-                    completed_progress += 1
-                    if on_progress:
-                        on_progress(clip.name, completed_progress, range_count)
+                writer.raise_if_failed()
 
                 batch_images = prefetched_batch.batch_images
                 batch_masks = prefetched_batch.batch_masks
@@ -750,13 +915,26 @@ class CorridorKeyService:
                 prepared_batch = prefetched_batch.prepared_batch
 
                 if not batch_images:
+                    if prefetched_batch.early_results or prefetched_batch.early_warnings:
+                        writer.submit(
+                            _PendingExportBatch(
+                                batch_meta=[],
+                                early_results=prefetched_batch.early_results,
+                                early_warnings=prefetched_batch.early_warnings,
+                            )
+                        )
                     continue
 
                 t_batch = time.monotonic()
                 with self._gpu_lock:
-                    if prepared_batch is not None:
+                    if prepared_batch is not None and use_raw_prepared_engine:
+                        batch_results = None
+                        raw_batch = run_prepared_batch_raw(prepared_batch)
+                    elif prepared_batch is not None:
+                        raw_batch = None
                         batch_results = process_prepared_batch(prepared_batch)
                     elif use_batched_engine:
+                        raw_batch = None
                         batch_results = process_batch(
                             batch_images,
                             batch_masks,
@@ -768,6 +946,7 @@ class CorridorKeyService:
                             refiner_scale=params.refiner_scale,
                         )
                     else:
+                        raw_batch = None
                         batch_results = [
                             engine.process_frame(
                                 image,
@@ -788,30 +967,37 @@ class CorridorKeyService:
                     f"Clip '{clip.name}': batch of {len(batch_images)} frame(s) in {time.monotonic() - t_batch:.3f}s"
                 )
 
-                if len(batch_results) != len(batch_meta):
+                if batch_results is not None and len(batch_results) != len(batch_meta):
                     raise RuntimeError(
                         f"Engine returned {len(batch_results)} results for a batch of {len(batch_meta)} frames"
                     )
 
-                for res, (i, input_stem, _is_linear) in zip(batch_results, batch_meta, strict=True):
-                    if job and job.is_cancelled:
-                        raise JobCancelledError(clip.name, i)
-                    try:
-                        self._write_outputs(res, dirs, input_stem, clip.name, i, cfg)
-                        results.append(FrameResult(i, input_stem, True))
-                    except WriteFailureError as e:
-                        logger.error(str(e))
-                        results.append(FrameResult(i, input_stem, False, str(e)))
-                        if on_warning:
-                            on_warning(str(e))
-                    completed_progress += 1
-                    if on_progress:
-                        on_progress(clip.name, completed_progress, range_count)
+                if job and job.is_cancelled:
+                    raise JobCancelledError(clip.name, batch_meta[0][0])
 
-            if on_progress:
-                on_progress(clip.name, range_count, range_count)
+                writer.submit(
+                    _PendingExportBatch(
+                        batch_meta=batch_meta,
+                        early_results=prefetched_batch.early_results,
+                        early_warnings=prefetched_batch.early_warnings,
+                        batch_results=batch_results,
+                        raw_batch=raw_batch,
+                        finalize_raw_batch=(
+                            (lambda raw, prepared=prepared_batch: finalize_raw_batch(raw, prepared))
+                            if raw_batch is not None
+                            else None
+                        ),
+                    )
+                )
+
+            results = writer.close()
 
         finally:
+            if not writer.closed:
+                try:
+                    writer.close()
+                except Exception as exc:
+                    logger.warning("Async export writer shutdown warning: %s", exc)
             if input_cap:
                 input_cap.release()
             if alpha_cap:

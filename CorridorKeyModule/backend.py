@@ -26,6 +26,8 @@ VALID_BACKENDS = ("auto", "torch", "mlx")
 _MLX_IMAGENET_MEAN = np.array([0.485, 0.456, 0.406], dtype=np.float32)
 _MLX_IMAGENET_STD = np.array([0.229, 0.224, 0.225], dtype=np.float32)
 _MAX_MLX_PREPARE_WORKERS = 8
+_MAX_MLX_POSTPROCESS_WORKERS = 8
+_MLX_BATCH_CLEANUP_INTERVAL = max(1, int(os.environ.get("CORRIDORKEY_MLX_CLEANUP_INTERVAL", "12")))
 
 
 @dataclass
@@ -45,6 +47,21 @@ class _PreparedMLXBatch:
     despill_strength: float
     auto_despeckle: bool
     despeckle_size: int
+
+
+@dataclass
+class _RawMLXGroupOutput:
+    indices: list[int]
+    alpha_np: np.ndarray
+    fg_np: np.ndarray
+    original_sizes: list[tuple[int, int]]
+
+
+@dataclass
+class _RawMLXBatchOutput:
+    groups: list[_RawMLXGroupOutput]
+    batch_size: int
+    fg_is_straight: bool
 
 
 def resolve_backend(requested: str | None = None) -> str:
@@ -259,12 +276,14 @@ class _MLXEngineAdapter:
 
     def __init__(self, raw_engine):
         self._engine = raw_engine
+        self._batches_since_cleanup = 0
         logger.info("MLX adapter active: despill and despeckle are handled by the adapter layer, not native MLX")
 
     def unload(self) -> None:
         """Release MLX model references and clear cached allocator state."""
         raw_engine = self._engine
         self._engine = None
+        self._batches_since_cleanup = 0
 
         try:
             if raw_engine is not None and hasattr(raw_engine, "unload"):
@@ -272,14 +291,7 @@ class _MLXEngineAdapter:
         except Exception as exc:
             logger.debug("MLX engine unload warning: %s", exc)
 
-        gc.collect()
-
-        try:
-            import mlx.core as mx
-
-            mx.clear_cache()
-        except Exception as exc:
-            logger.debug("MLX cache clear warning: %s", exc)
+        self._cleanup_mlx_runtime(force=True)
 
     @staticmethod
     def _to_u8_image(image: np.ndarray) -> np.ndarray:
@@ -332,17 +344,42 @@ class _MLXEngineAdapter:
         )
 
     @staticmethod
-    def _prepare_worker_count(item_count: int) -> int:
+    def _worker_count(item_count: int, max_workers: int) -> int:
         cpu_count = os.cpu_count() or 1
-        return max(1, min(item_count, cpu_count, _MAX_MLX_PREPARE_WORKERS))
+        return max(1, min(item_count, cpu_count, max_workers))
+
+    def _parallel_map_items(self, items, map_item, *, max_workers: int, thread_name_prefix: str):
+        worker_count = self._worker_count(len(items), max_workers)
+        if worker_count == 1:
+            return [map_item(item) for item in items]
+
+        with ThreadPoolExecutor(max_workers=worker_count, thread_name_prefix=thread_name_prefix) as executor:
+            return list(executor.map(map_item, items))
 
     def _parallel_prepare_items(self, items, prepare_item):
-        worker_count = self._prepare_worker_count(len(items))
-        if worker_count == 1:
-            return [prepare_item(*item) for item in items]
+        return self._parallel_map_items(
+            items,
+            lambda item: prepare_item(*item),
+            max_workers=_MAX_MLX_PREPARE_WORKERS,
+            thread_name_prefix="mlx-prepare",
+        )
 
-        with ThreadPoolExecutor(max_workers=worker_count, thread_name_prefix="mlx-prepare") as executor:
-            return list(executor.map(lambda item: prepare_item(*item), items))
+    def _cleanup_mlx_runtime(self, *, force: bool = False) -> None:
+        if force:
+            self._batches_since_cleanup = 0
+        else:
+            self._batches_since_cleanup += 1
+            if self._batches_since_cleanup < _MLX_BATCH_CLEANUP_INTERVAL:
+                return
+            self._batches_since_cleanup = 0
+
+        gc.collect()
+        try:
+            import mlx.core as mx
+
+            mx.clear_cache()
+        except Exception as exc:
+            logger.debug("MLX cache clear warning: %s", exc)
 
     def _prepare_full_frame_item(self, image_u8: np.ndarray, mask_u8: np.ndarray) -> tuple[np.ndarray, tuple[int, int]]:
         from PIL import Image
@@ -420,37 +457,73 @@ class _MLXEngineAdapter:
             )
         return groups
 
-    def _finalize_full_frame_batch(
+    @staticmethod
+    def _mlx_outputs_to_numpy(alpha_out, fg_out) -> tuple[np.ndarray, np.ndarray]:
+        alpha_np = np.clip(np.array(alpha_out), 0.0, 1.0)
+        fg_np = np.clip(np.array(fg_out), 0.0, 1.0)
+        return alpha_np, fg_np
+
+    def _finalize_raw_item(self, item) -> dict[str, np.ndarray]:
+        from PIL import Image
+
+        alpha_frame_np, fg_frame_np, original_size, fg_is_straight = item
+        original_h, original_w = original_size
+        alpha_u8 = (np.clip(alpha_frame_np[:, :, 0], 0.0, 1.0) * 255.0).astype(np.uint8)
+        fg_u8 = (np.clip(fg_frame_np, 0.0, 1.0) * 255.0).astype(np.uint8)
+
+        if alpha_u8.shape != (original_h, original_w):
+            target = (original_w, original_h)
+            alpha_u8 = np.asarray(
+                Image.fromarray(alpha_u8, mode="L").resize(target, Image.Resampling.BICUBIC),
+                dtype=np.uint8,
+            )
+            fg_u8 = np.asarray(
+                Image.fromarray(fg_u8, mode="RGB").resize(target, Image.Resampling.BICUBIC),
+                dtype=np.uint8,
+            )
+
+        return self._build_raw_result(alpha_u8, fg_u8, fg_is_straight)
+
+    def _build_raw_results_from_numpy(
         self,
-        alpha_out,
-        fg_out,
+        alpha_np: np.ndarray,
+        fg_np: np.ndarray,
         original_sizes: list[tuple[int, int]],
         fg_is_straight: bool,
     ) -> list[dict[str, np.ndarray]]:
-        from PIL import Image
+        items = [
+            (alpha_np[idx], fg_np[idx], original_sizes[idx], fg_is_straight)
+            for idx in range(len(original_sizes))
+        ]
+        return self._parallel_map_items(
+            items,
+            self._finalize_raw_item,
+            max_workers=_MAX_MLX_POSTPROCESS_WORKERS,
+            thread_name_prefix="mlx-finalize",
+        )
 
-        alpha_np = np.clip(np.array(alpha_out), 0.0, 1.0)
-        fg_np = np.clip(np.array(fg_out), 0.0, 1.0)
+    @staticmethod
+    def _wrap_raw_output_item(item) -> dict[str, np.ndarray]:
+        raw, despill_strength, auto_despeckle, despeckle_size = item
+        return _wrap_mlx_output(raw, despill_strength, auto_despeckle, despeckle_size)
 
-        results: list[dict[str, np.ndarray]] = []
-        for idx, (original_h, original_w) in enumerate(original_sizes):
-            alpha_u8 = (alpha_np[idx, :, :, 0] * 255.0).astype(np.uint8)
-            fg_u8 = (fg_np[idx] * 255.0).astype(np.uint8)
-
-            if alpha_u8.shape != (original_h, original_w):
-                target = (original_w, original_h)
-                alpha_u8 = np.asarray(
-                    Image.fromarray(alpha_u8, mode="L").resize(target, Image.Resampling.BICUBIC),
-                    dtype=np.uint8,
-                )
-                fg_u8 = np.asarray(
-                    Image.fromarray(fg_u8, mode="RGB").resize(target, Image.Resampling.BICUBIC),
-                    dtype=np.uint8,
-                )
-
-            results.append(self._build_raw_result(alpha_u8, fg_u8, fg_is_straight))
-
-        return results
+    def _wrap_raw_outputs(
+        self,
+        raw_outputs: list[dict[str, np.ndarray]],
+        despill_strength: float,
+        auto_despeckle: bool,
+        despeckle_size: int,
+    ) -> list[dict[str, np.ndarray]]:
+        items = [
+            (raw, despill_strength, auto_despeckle, despeckle_size)
+            for raw in raw_outputs
+        ]
+        return self._parallel_map_items(
+            items,
+            self._wrap_raw_output_item,
+            max_workers=_MAX_MLX_POSTPROCESS_WORKERS,
+            thread_name_prefix="mlx-post",
+        )
 
     def _run_full_frame_batch(
         self,
@@ -460,7 +533,9 @@ class _MLXEngineAdapter:
         fg_is_straight: bool,
     ) -> list[dict[str, np.ndarray]]:
         inputs_np, original_sizes = self._prepare_full_frame_batch(images_u8, masks_u8)
-        return self._run_full_frame_prepared(inputs_np, original_sizes, refiner_scale, fg_is_straight)
+        raw_batch = self._run_full_frame_prepared(inputs_np, original_sizes, refiner_scale, fg_is_straight)
+        group = raw_batch.groups[0]
+        return self._build_raw_results_from_numpy(group.alpha_np, group.fg_np, group.original_sizes, fg_is_straight)
 
     def _run_full_frame_prepared(
         self,
@@ -468,7 +543,7 @@ class _MLXEngineAdapter:
         original_sizes: list[tuple[int, int]],
         refiner_scale: float,
         fg_is_straight: bool,
-    ) -> list[dict[str, np.ndarray]]:
+    ) -> _RawMLXBatchOutput:
         import mlx.core as mx
 
         x = mx.array(inputs_np)
@@ -476,12 +551,22 @@ class _MLXEngineAdapter:
         alpha_out, fg_out = self._select_mlx_outputs(outputs, refiner_scale)
         mx.eval(alpha_out, fg_out)  # noqa: S307
 
-        results = self._finalize_full_frame_batch(alpha_out, fg_out, original_sizes, fg_is_straight)
+        alpha_np, fg_np = self._mlx_outputs_to_numpy(alpha_out, fg_out)
 
         del outputs, alpha_out, fg_out, x
-        gc.collect()
-        mx.clear_cache()
-        return results
+        self._cleanup_mlx_runtime()
+        return _RawMLXBatchOutput(
+            groups=[
+                _RawMLXGroupOutput(
+                    indices=list(range(len(original_sizes))),
+                    alpha_np=alpha_np,
+                    fg_np=fg_np,
+                    original_sizes=original_sizes,
+                )
+            ],
+            batch_size=len(original_sizes),
+            fg_is_straight=fg_is_straight,
+        )
 
     def _run_tiled_batch_same_shape(
         self,
@@ -494,10 +579,16 @@ class _MLXEngineAdapter:
         if len(prepared_groups) != 1:
             raise RuntimeError("Expected one same-shape MLX group during tiled batch preparation")
         prepared_group = prepared_groups[0]
-        return self._run_tiled_prepared_same_shape(
+        raw_group = self._run_tiled_prepared_same_shape(
             prepared_group.inputs_np,
             prepared_group.original_sizes,
             refiner_scale,
+            fg_is_straight,
+        )
+        return self._build_raw_results_from_numpy(
+            raw_group.alpha_np,
+            raw_group.fg_np,
+            raw_group.original_sizes,
             fg_is_straight,
         )
 
@@ -507,7 +598,7 @@ class _MLXEngineAdapter:
         original_sizes: list[tuple[int, int]],
         refiner_scale: float,
         fg_is_straight: bool,
-    ) -> list[dict[str, np.ndarray]]:
+    ) -> _RawMLXGroupOutput:
         import mlx.core as mx
 
         x = mx.array(inputs_np)
@@ -520,11 +611,15 @@ class _MLXEngineAdapter:
             outputs = self._engine._model(x)
             alpha_out, fg_out = self._select_mlx_outputs(outputs, refiner_scale)
             mx.eval(alpha_out, fg_out)  # noqa: S307
-            results = self._finalize_full_frame_batch(alpha_out, fg_out, original_sizes, fg_is_straight)
+            alpha_np, fg_np = self._mlx_outputs_to_numpy(alpha_out, fg_out)
             del outputs, alpha_out, fg_out, x
-            gc.collect()
-            mx.clear_cache()
-            return results
+            self._cleanup_mlx_runtime()
+            return _RawMLXGroupOutput(
+                indices=list(range(len(original_sizes))),
+                alpha_np=alpha_np,
+                fg_np=fg_np,
+                original_sizes=original_sizes,
+            )
 
         y_coords = _compute_mlx_tile_coords(full_h, tile_size, overlap)
         x_coords = _compute_mlx_tile_coords(full_w, tile_size, overlap)
@@ -562,17 +657,18 @@ class _MLXEngineAdapter:
                 weight_accum[:, y_start:y_end, x_start:x_end, :] += weights[None, :, :, :]
 
                 del out, tile, alpha_tile, fg_tile, alpha_tile_np, fg_tile_np
-                gc.collect()
-                mx.clear_cache()
 
         alpha_final = alpha_accum / np.maximum(weight_accum, 1e-8)
         fg_final = fg_accum / np.maximum(weight_accum, 1e-8)
 
-        results = self._finalize_full_frame_batch(alpha_final, fg_final, original_sizes, fg_is_straight)
         del x
-        gc.collect()
-        mx.clear_cache()
-        return results
+        self._cleanup_mlx_runtime()
+        return _RawMLXGroupOutput(
+            indices=list(range(len(original_sizes))),
+            alpha_np=alpha_final,
+            fg_np=fg_final,
+            original_sizes=original_sizes,
+        )
 
     def _run_tiled_batch(
         self,
@@ -582,7 +678,21 @@ class _MLXEngineAdapter:
         fg_is_straight: bool,
     ) -> list[dict[str, np.ndarray]]:
         prepared_groups = self._prepare_tiled_batch(images_u8, masks_u8)
-        return self._run_tiled_prepared(prepared_groups, len(images_u8), refiner_scale, fg_is_straight)
+        raw_batch = self._run_tiled_prepared(prepared_groups, len(images_u8), refiner_scale, fg_is_straight)
+        raw_results: list[dict[str, np.ndarray] | None] = [None] * raw_batch.batch_size
+        for group in raw_batch.groups:
+            group_results = self._build_raw_results_from_numpy(
+                group.alpha_np,
+                group.fg_np,
+                group.original_sizes,
+                fg_is_straight,
+            )
+            for idx, result in zip(group.indices, group_results, strict=True):
+                raw_results[idx] = result
+
+        if any(result is None for result in raw_results):
+            raise RuntimeError("MLX tiled batch inference failed to produce outputs for all frames")
+        return [result for result in raw_results if result is not None]
 
     def _run_tiled_prepared(
         self,
@@ -590,8 +700,8 @@ class _MLXEngineAdapter:
         batch_size: int,
         refiner_scale: float,
         fg_is_straight: bool,
-    ) -> list[dict[str, np.ndarray]]:
-        raw_results: list[dict[str, np.ndarray] | None] = [None] * batch_size
+    ) -> _RawMLXBatchOutput:
+        raw_group_outputs: list[_RawMLXGroupOutput] = []
         for prepared_group in prepared_groups:
             batch_results = self._run_tiled_prepared_same_shape(
                 prepared_group.inputs_np,
@@ -599,12 +709,20 @@ class _MLXEngineAdapter:
                 refiner_scale,
                 fg_is_straight,
             )
-            for idx, result in zip(prepared_group.indices, batch_results, strict=True):
-                raw_results[idx] = result
+            raw_group_outputs.append(
+                _RawMLXGroupOutput(
+                    indices=prepared_group.indices,
+                    alpha_np=batch_results.alpha_np,
+                    fg_np=batch_results.fg_np,
+                    original_sizes=batch_results.original_sizes,
+                )
+            )
 
-        if any(result is None for result in raw_results):
-            raise RuntimeError("MLX tiled batch inference failed to produce outputs for all frames")
-        return [result for result in raw_results if result is not None]
+        return _RawMLXBatchOutput(
+            groups=raw_group_outputs,
+            batch_size=batch_size,
+            fg_is_straight=fg_is_straight,
+        )
 
     def prepare_batch(
         self,
@@ -653,32 +771,54 @@ class _MLXEngineAdapter:
             despeckle_size=despeckle_size,
         )
 
-    def process_prepared_batch(self, prepared_batch: _PreparedMLXBatch):
-        """Run MLX inference from a CPU-prepared batch."""
+    def run_prepared_batch_raw(self, prepared_batch: _PreparedMLXBatch) -> _RawMLXBatchOutput:
+        """Run MLX GPU inference and return raw batch tensors materialized as NumPy."""
         if prepared_batch.full_frame:
-            raw_outputs = self._run_full_frame_prepared(
+            return self._run_full_frame_prepared(
                 prepared_batch.groups[0].inputs_np,
                 prepared_batch.groups[0].original_sizes,
                 prepared_batch.refiner_scale,
                 prepared_batch.fg_is_straight,
             )
-        else:
-            raw_outputs = self._run_tiled_prepared(
-                prepared_batch.groups,
-                prepared_batch.batch_size,
-                prepared_batch.refiner_scale,
-                prepared_batch.fg_is_straight,
-            )
+        return self._run_tiled_prepared(
+            prepared_batch.groups,
+            prepared_batch.batch_size,
+            prepared_batch.refiner_scale,
+            prepared_batch.fg_is_straight,
+        )
 
-        return [
-            _wrap_mlx_output(
-                raw,
-                prepared_batch.despill_strength,
-                prepared_batch.auto_despeckle,
-                prepared_batch.despeckle_size,
+    def finalize_raw_batch(
+        self,
+        raw_batch: _RawMLXBatchOutput,
+        prepared_batch: _PreparedMLXBatch,
+    ) -> list[dict[str, np.ndarray]]:
+        """Convert raw MLX batch outputs into the normalized Torch-compatible contract."""
+        raw_results: list[dict[str, np.ndarray] | None] = [None] * raw_batch.batch_size
+        for group in raw_batch.groups:
+            group_results = self._build_raw_results_from_numpy(
+                group.alpha_np,
+                group.fg_np,
+                group.original_sizes,
+                raw_batch.fg_is_straight,
             )
-            for raw in raw_outputs
-        ]
+            for idx, result in zip(group.indices, group_results, strict=True):
+                raw_results[idx] = result
+
+        if any(result is None for result in raw_results):
+            raise RuntimeError("MLX raw batch finalization failed to produce outputs for all frames")
+
+        finalized_inputs = [result for result in raw_results if result is not None]
+        return self._wrap_raw_outputs(
+            finalized_inputs,
+            prepared_batch.despill_strength,
+            prepared_batch.auto_despeckle,
+            prepared_batch.despeckle_size,
+        )
+
+    def process_prepared_batch(self, prepared_batch: _PreparedMLXBatch):
+        """Run MLX inference from a CPU-prepared batch."""
+        raw_outputs = self.run_prepared_batch_raw(prepared_batch)
+        return self.finalize_raw_batch(raw_outputs, prepared_batch)
 
     def process_batch(
         self,

@@ -1080,6 +1080,7 @@ class ExportWorker(QThread):
         self._params = params
         self._output_config = output_config
         self._batch_size = max(1, batch_size)
+        self._preview_stride = max(1, min(4, self._batch_size))
         self._job = GPUJob(JobType.INFERENCE, clip.name)
 
     def request_cancel(self) -> None:
@@ -1088,32 +1089,25 @@ class ExportWorker(QThread):
     def run(self) -> None:
         try:
             self.status.emit(
-                f"Exporting CorridorKey outputs in batches of {self._batch_size}. "
+                f"Exporting CorridorKey outputs in pipelined batches of {self._batch_size}. "
                 "Press Esc or use Cancel to stop after the current batch."
             )
 
             def on_progress(_clip_name: str, current: int, total: int) -> None:
                 self.progress.emit(current, total)
-                comp_dir = os.path.join(self._clip.root_path, "Output", "Comp")
-                if not os.path.isdir(comp_dir):
-                    return
-                comp_files = sorted(f for f in os.listdir(comp_dir) if is_image_file(f))
-                if not comp_files:
-                    return
-                latest = os.path.join(comp_dir, comp_files[-1])
-                image = cv2.imread(latest, cv2.IMREAD_COLOR)
-                if image is None:
-                    return
-                preview_index = max(0, min(current - 1, total - 1)) if total > 0 else 0
-                self.preview.emit(preview_index, cv2.cvtColor(image, cv2.COLOR_BGR2RGB))
+
+            def on_preview(frame_index: int, comp_rgb: np.ndarray) -> None:
+                self.preview.emit(frame_index, comp_rgb)
 
             self._service.run_inference(
                 self._clip,
                 self._params,
                 job=self._job,
                 on_progress=on_progress,
+                on_preview=on_preview,
                 output_config=self._output_config,
                 batch_size=self._batch_size,
+                preview_stride=self._preview_stride,
             )
             self.completed.emit(os.path.join(self._clip.root_path, "Output"))
         except JobCancelledError as exc:
