@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import platform
 import shutil
 import sys
 from importlib.util import find_spec
@@ -22,6 +23,7 @@ def _configure_local_caches(env: dict[str, str] | None = None) -> dict[str, str]
     for key, path in cache_map.items():
         target.setdefault(key, str(path))
         os.makedirs(target[key], exist_ok=True)
+    target.setdefault("PYTORCH_ENABLE_MPS_FALLBACK", "1")
     return target
 
 
@@ -38,17 +40,22 @@ def _project_venv_python() -> Path:
     return _PROJECT_ROOT / ".venv" / "bin" / "python"
 
 
-def _running_inside_project_venv() -> bool:
-    venv_root = _project_venv_python().parent.parent.resolve()
-    try:
-        return Path(sys.prefix).resolve() == venv_root
-    except Exception:
-        return False
-
-
 def _missing_runtime_modules() -> list[str]:
-    required = ("PySide6", "cv2", "numpy", "torch")
+    required = ("PySide6", "cv2", "numpy", "torch", "transformers")
     return [name for name in required if find_spec(name) is None]
+
+
+def _apple_silicon_uv_args() -> list[str]:
+    if sys.platform != "darwin" or platform.machine() != "arm64":
+        return []
+    return [
+        "--with",
+        "mlx>=0.29",
+        "--with",
+        "mlx-metal>=0.29",
+        "--with",
+        "corridorkey-mlx@git+https://github.com/nikopueringer/corridorkey-mlx.git@04503e797060e091f991bc88b85ec61b0b9b862b",
+    ]
 
 
 def _relaunch_with_runtime() -> None:
@@ -56,11 +63,11 @@ def _relaunch_with_runtime() -> None:
         return
 
     missing = _missing_runtime_modules()
-    if _running_inside_project_venv() and not missing:
+    if not missing:
         return
 
     if os.environ.get(_BOOTSTRAP_ENV) == "1":
-        missing_text = ", ".join(missing) if missing else "the project runtime"
+        missing_text = ", ".join(missing)
         raise SystemExit(f"Failed to bootstrap CorridorKey Qt GUI with {missing_text}.")
 
     env = os.environ.copy()
@@ -70,7 +77,7 @@ def _relaunch_with_runtime() -> None:
     uv = shutil.which("uv")
     if uv:
         print("Bootstrapping CorridorKey Qt GUI with the project uv environment...", file=sys.stderr)
-        cmd = [uv, "run", "--group", "gui", "python", str(_THIS_FILE), *sys.argv[1:]]
+        cmd = [uv, "run", "--group", "gui", *_apple_silicon_uv_args(), "python", str(_THIS_FILE), *sys.argv[1:]]
         os.execvpe(uv, cmd, env)
 
     venv_python = _project_venv_python()
@@ -90,9 +97,12 @@ _configure_local_caches()
 _relaunch_with_runtime()
 
 import glob
+import gc
 import logging
 import threading
+import traceback
 from dataclasses import dataclass
+from typing import Callable
 
 import cv2
 import numpy as np
@@ -151,6 +161,18 @@ _MASK_PALETTE = [
     (107, 203, 119),
 ]
 
+_SAM2_VARIANTS = {
+    "SAM2 Tiny (fast)": {
+        "label": "SAM2.1 Tiny",
+        "repos": ("facebook/sam2.1-hiera-tiny", "facebook/sam2-hiera-tiny"),
+    },
+    "SAM2 Small (balanced)": {
+        "label": "SAM2.1 Small",
+        "repos": ("facebook/sam2.1-hiera-small", "facebook/sam2-hiera-small"),
+    },
+}
+_DEFAULT_SAM2_VARIANT = "SAM2 Tiny (fast)"
+
 
 @dataclass
 class SegmentationCandidate:
@@ -159,6 +181,7 @@ class SegmentationCandidate:
     score: float
     box: tuple[int, int, int, int]
     mask: np.ndarray
+    prompt_point: tuple[int, int] | None = None
 
 
 def _normalize_to_uint8(image: np.ndarray) -> np.ndarray:
@@ -218,44 +241,6 @@ def _clip_box(box: tuple[int, int, int, int], width: int, height: int) -> tuple[
     return x1, y1, x2, y2
 
 
-def _xyxy_to_xywh(box: tuple[int, int, int, int]) -> tuple[int, int, int, int]:
-    x1, y1, x2, y2 = box
-    return x1, y1, max(1, x2 - x1), max(1, y2 - y1)
-
-
-def _xywh_to_xyxy(box: tuple[float, float, float, float]) -> tuple[int, int, int, int]:
-    x, y, w, h = box
-    x1 = int(round(x))
-    y1 = int(round(y))
-    x2 = int(round(x + w))
-    y2 = int(round(y + h))
-    return x1, y1, x2, y2
-
-
-def _box_iou(a: tuple[int, int, int, int], b: tuple[int, int, int, int]) -> float:
-    ax1, ay1, ax2, ay2 = a
-    bx1, by1, bx2, by2 = b
-    inter_x1 = max(ax1, bx1)
-    inter_y1 = max(ay1, by1)
-    inter_x2 = min(ax2, bx2)
-    inter_y2 = min(ay2, by2)
-    inter_w = max(0, inter_x2 - inter_x1)
-    inter_h = max(0, inter_y2 - inter_y1)
-    inter_area = inter_w * inter_h
-    area_a = max(1, ax2 - ax1) * max(1, ay2 - ay1)
-    area_b = max(1, bx2 - bx1) * max(1, by2 - by1)
-    union = area_a + area_b - inter_area
-    return inter_area / union if union else 0.0
-
-
-def _rectangle_mask(shape: tuple[int, int], box: tuple[int, int, int, int]) -> np.ndarray:
-    height, width = shape
-    x1, y1, x2, y2 = _clip_box(box, width, height)
-    mask = np.zeros((height, width), dtype=np.float32)
-    mask[y1:y2, x1:x2] = 1.0
-    return mask
-
-
 def _merge_candidate_masks(candidates: list[SegmentationCandidate]) -> np.ndarray | None:
     if not candidates:
         return None
@@ -278,12 +263,34 @@ def _coarse_hint_from_mask(mask: np.ndarray, blur_size: int, erode_size: int) ->
     return binary
 
 
-def _create_tracker():
-    if hasattr(cv2, "legacy") and hasattr(cv2.legacy, "TrackerCSRT_create"):
-        return cv2.legacy.TrackerCSRT_create()
-    if hasattr(cv2, "TrackerCSRT_create"):
-        return cv2.TrackerCSRT_create()
-    return None
+def _mask_box(mask: np.ndarray) -> tuple[int, int, int, int] | None:
+    binary = mask >= 0.5
+    if not binary.any():
+        return None
+    ys, xs = np.nonzero(binary)
+    return int(xs.min()), int(ys.min()), int(xs.max()) + 1, int(ys.max()) + 1
+
+
+def _mask_iou(a: np.ndarray, b: np.ndarray) -> float:
+    a_binary = a >= 0.5
+    b_binary = b >= 0.5
+    intersection = int(np.logical_and(a_binary, b_binary).sum())
+    union = int(np.logical_or(a_binary, b_binary).sum())
+    return intersection / union if union else 0.0
+
+
+def _make_candidate(mask: np.ndarray, score: float, label_index: int, prompt_point: tuple[int, int]) -> SegmentationCandidate:
+    box = _mask_box(mask)
+    if box is None:
+        raise ValueError("The selected point did not produce a valid object mask.")
+    return SegmentationCandidate(
+        label_id=label_index,
+        label_name=f"Object {label_index + 1}",
+        score=score,
+        box=box,
+        mask=mask.astype(np.float32),
+        prompt_point=prompt_point,
+    )
 
 
 def _overlay_candidates(
@@ -386,6 +393,20 @@ def _copy_alpha_asset(source_path: str, clip_root: str) -> str:
         return target_dir
 
     raise ValueError("Mask hint must be a video file, image, or image-sequence directory")
+
+
+def _format_exception_details(context: str, exc: BaseException) -> str:
+    details = "".join(traceback.format_exception(type(exc), exc, exc.__traceback__)).strip()
+    return f"{context}\n{details}" if details else f"{context}\n{exc}"
+
+
+def _summarize_error_for_dialog(message: str) -> str:
+    if "Traceback (most recent call last):" not in message:
+        return message
+    lines = [line for line in message.strip().splitlines() if line.strip()]
+    summary_lines = lines[-3:] if len(lines) >= 3 else lines
+    summary = "\n".join(summary_lines)
+    return f"{summary}\n\nFull traceback is in the Session log."
 
 
 class MediaReader:
@@ -524,146 +545,389 @@ class DropPreviewLabel(QLabel):
 class SegmentationModelManager:
     def __init__(self):
         self._lock = threading.Lock()
-        self._model = None
-        self._categories: list[str] = []
+        self._image_model = None
+        self._image_processor = None
+        self._video_model = None
+        self._video_processor = None
+        self._variant_key: str | None = None
+        self._variant_label = "SAM2"
+        self._repo_id: str | None = None
         self._device = "cpu"
+        self._dtype = torch.float32
 
-    def detect_candidates(
+    def runtime_label(self) -> str:
+        return f"{self._variant_label} on {self._device}"
+
+    def segment_point(
         self,
         frame_rgb: np.ndarray,
+        point_xy: tuple[int, int],
         preferred_device: str,
-        score_threshold: float,
-    ) -> tuple[list[SegmentationCandidate], str]:
+        model_variant: str,
+    ) -> tuple[SegmentationCandidate, str]:
         with self._lock:
-            outputs = self._predict_batch([frame_rgb], preferred_device)
+            try:
+                candidate = self._segment_point_once(frame_rgb, point_xy, preferred_device, model_variant)
+            except Exception:
+                if self._device == "cpu":
+                    raise
+                logger.warning("SAM2 image segmentation failed on %s, retrying on CPU", self._device)
+                self._reset_runtime()
+                candidate = self._segment_point_once(frame_rgb, point_xy, "cpu", model_variant, force_device="cpu")
+        return candidate, self.runtime_label()
 
-        candidates = self._outputs_to_candidates([frame_rgb], outputs, score_threshold)
-        return candidates[0], self._device
-
-    def detect_candidates_batch(
+    def generate_mask_hint(
         self,
-        frames_rgb: list[np.ndarray],
+        source_path: str,
+        clip_root: str,
+        selections: list[SegmentationCandidate],
         preferred_device: str,
-        score_threshold: float,
-    ) -> tuple[list[list[SegmentationCandidate]], str]:
-        if not frames_rgb:
-            return [], self._device
-
+        model_variant: str,
+        blur_size: int,
+        erode_size: int,
+        cache_size: int,
+        cancel_event: threading.Event,
+        on_frame: Callable[[int, int, np.ndarray, np.ndarray], None],
+    ) -> tuple[str, str]:
         with self._lock:
-            outputs = self._predict_batch(frames_rgb, preferred_device)
-
-        return self._outputs_to_candidates(frames_rgb, outputs, score_threshold), self._device
-
-    def _predict_batch(self, frames_rgb: list[np.ndarray], preferred_device: str):
-        if self._model is None:
-            self._load_model(preferred_device)
-
-        tensors = [torch.from_numpy(frame.transpose(2, 0, 1)).float().div(255.0).to(self._device) for frame in frames_rgb]
-        try:
-            with torch.inference_mode():
-                return self._model(tensors)
-        except Exception:
-            if self._device == "cpu":
-                raise
-            self._load_model("cpu")
-            tensors = [tensor.to("cpu") for tensor in tensors]
-            with torch.inference_mode():
-                return self._model(tensors)
-
-    def _outputs_to_candidates(
-        self,
-        frames_rgb: list[np.ndarray],
-        outputs: list[dict],
-        score_threshold: float,
-    ) -> list[list[SegmentationCandidate]]:
-        batches: list[list[SegmentationCandidate]] = []
-        for frame_rgb, output in zip(frames_rgb, outputs):
-            scores = output["scores"].detach().cpu().numpy()
-            labels = output["labels"].detach().cpu().numpy()
-            boxes = output["boxes"].detach().cpu().numpy()
-            masks = output["masks"].detach().cpu().numpy()[:, 0]
-
-            candidates: list[SegmentationCandidate] = []
-            height, width = frame_rgb.shape[:2]
-            for score, label_id, box_array, mask in zip(scores, labels, boxes, masks):
-                if float(score) < score_threshold:
-                    continue
-                x1, y1, x2, y2 = [int(round(v)) for v in box_array.tolist()]
-                clipped_box = _clip_box((x1, y1, x2, y2), width, height)
-                label_index = int(label_id)
-                label_name = self._categories[label_index] if label_index < len(self._categories) else f"class_{label_id}"
-                candidates.append(
-                    SegmentationCandidate(
-                        label_id=label_index,
-                        label_name=label_name,
-                        score=float(score),
-                        box=clipped_box,
-                        mask=mask.astype(np.float32),
-                    )
+            try:
+                alpha_dir = self._generate_mask_hint_once(
+                    source_path,
+                    clip_root,
+                    selections,
+                    preferred_device,
+                    model_variant,
+                    blur_size,
+                    erode_size,
+                    cache_size,
+                    cancel_event,
+                    on_frame,
                 )
+            except Exception:
+                if self._device == "cpu":
+                    raise
+                logger.warning("SAM2 video propagation failed on %s, retrying on CPU", self._device)
+                self._reset_runtime()
+                alpha_dir = self._generate_mask_hint_once(
+                    source_path,
+                    clip_root,
+                    selections,
+                    "cpu",
+                    model_variant,
+                    blur_size,
+                    erode_size,
+                    cache_size,
+                    cancel_event,
+                    on_frame,
+                    force_device="cpu",
+                )
+        return alpha_dir, self.runtime_label()
 
-            candidates.sort(key=lambda item: item.score, reverse=True)
-            batches.append(candidates[:12])
-        return batches
+    def _segment_point_once(
+        self,
+        frame_rgb: np.ndarray,
+        point_xy: tuple[int, int],
+        preferred_device: str,
+        model_variant: str,
+        *,
+        force_device: str | None = None,
+    ) -> SegmentationCandidate:
+        self._ensure_image_runtime(preferred_device, model_variant, force_device=force_device)
+        inputs = self._image_processor(
+            images=frame_rgb,
+            input_points=[[[[float(point_xy[0]), float(point_xy[1])]]]],
+            input_labels=[[[1]]],
+            return_tensors="pt",
+        )
+        model_inputs = self._move_inputs_to_device(inputs, pixel_dtype=self._dtype)
+        with torch.inference_mode():
+            outputs = self._image_model(**model_inputs, multimask_output=False)
+        masks = self._image_processor.post_process_masks(outputs.pred_masks, inputs["original_sizes"], binarize=True)
+        mask = masks[0][0, 0].detach().cpu().numpy().astype(np.float32)
+        if float(mask.sum()) < 128.0:
+            raise RuntimeError("The selected point did not produce a stable object mask.")
+        score = 1.0
+        if outputs.iou_scores is not None:
+            score = float(outputs.iou_scores.reshape(-1)[0].detach().cpu().item())
+        if outputs.object_score_logits is not None:
+            object_score = torch.sigmoid(outputs.object_score_logits.reshape(-1)[0]).detach().cpu().item()
+            score = max(score, float(object_score))
+        return _make_candidate(mask, score, 0, point_xy)
 
-    def _load_model(self, preferred_device: str) -> None:
-        from torchvision.models.detection import MaskRCNN_ResNet50_FPN_Weights, maskrcnn_resnet50_fpn
+    def _generate_mask_hint_once(
+        self,
+        source_path: str,
+        clip_root: str,
+        selections: list[SegmentationCandidate],
+        preferred_device: str,
+        model_variant: str,
+        blur_size: int,
+        erode_size: int,
+        cache_size: int,
+        cancel_event: threading.Event,
+        on_frame: Callable[[int, int, np.ndarray, np.ndarray], None],
+        *,
+        force_device: str | None = None,
+    ) -> str:
+        self._ensure_video_runtime(preferred_device, model_variant, force_device=force_device)
 
-        device_order = [preferred_device] if preferred_device else []
+        alpha_dir = os.path.join(clip_root, "AlphaHint")
+        _clear_alpha_assets(clip_root)
+        os.makedirs(alpha_dir, exist_ok=True)
+
+        cap = cv2.VideoCapture(source_path)
+        if not cap.isOpened():
+            raise RuntimeError(f"Could not open source video: {source_path}")
+
+        total_frames = max(0, int(cap.get(cv2.CAP_PROP_FRAME_COUNT)))
+        try:
+            session = self._video_processor.init_video_session(
+                inference_device=self._device,
+                inference_state_device="cpu",
+                processing_device="cpu",
+                video_storage_device="cpu",
+                max_vision_features_cache_size=max(1, cache_size),
+                dtype=self._dtype,
+            )
+
+            frame_index = 0
+            while True:
+                if cancel_event.is_set():
+                    raise JobCancelledError(Path(clip_root).name, frame_index)
+
+                ok, frame_bgr = cap.read()
+                if not ok or frame_bgr is None:
+                    break
+
+                frame_rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
+                frame_inputs = self._video_processor(images=frame_rgb, return_tensors="pt")
+                pixel_values = frame_inputs["pixel_values"]
+
+                if frame_index == 0:
+                    self._video_processor.add_inputs_to_inference_session(
+                        session,
+                        frame_idx=0,
+                        obj_ids=[candidate.label_id for candidate in selections],
+                        input_masks=[candidate.mask >= 0.5 for candidate in selections],
+                    )
+
+                with torch.inference_mode():
+                    outputs = self._video_model(session, frame_idx=frame_index, frame=pixel_values)
+
+                processed_masks = self._video_processor.post_process_masks(
+                    [outputs.pred_masks],
+                    frame_inputs["original_sizes"],
+                    binarize=True,
+                )
+                merged_mask = np.zeros(frame_rgb.shape[:2], dtype=np.float32)
+                for object_masks in processed_masks[0]:
+                    merged_mask = np.maximum(merged_mask, object_masks[0].detach().cpu().numpy().astype(np.float32))
+
+                hint = _coarse_hint_from_mask(merged_mask, blur_size, erode_size)
+                out_path = os.path.join(alpha_dir, f"frame_{frame_index:06d}.png")
+                cv2.imwrite(out_path, hint)
+                on_frame(frame_index, total_frames, frame_rgb, hint)
+                self._trim_processed_frames(session, frame_index, max(2, cache_size))
+                frame_index += 1
+
+            if frame_index == 0:
+                raise RuntimeError("No frames were read from the source video")
+            return alpha_dir
+        finally:
+            cap.release()
+
+    def _ensure_image_runtime(self, preferred_device: str, model_variant: str, *, force_device: str | None = None) -> None:
+        if self._image_model is not None and self._variant_key == model_variant and (force_device is None or self._device == force_device):
+            return
+        self._unload_image_runtime()
+        self._unload_video_runtime()
+        self._load_image_runtime(preferred_device, model_variant, force_device=force_device)
+
+    def _ensure_video_runtime(self, preferred_device: str, model_variant: str, *, force_device: str | None = None) -> None:
+        if self._video_model is not None and self._variant_key == model_variant and (force_device is None or self._device == force_device):
+            return
+        self._unload_video_runtime()
+        self._unload_image_runtime()
+        self._load_video_runtime(preferred_device, model_variant, force_device=force_device)
+
+    def _load_image_runtime(self, preferred_device: str, model_variant: str, *, force_device: str | None = None) -> None:
+        from transformers import Sam2Model, Sam2Processor
+
+        self._load_runtime(
+            model_variant,
+            preferred_device,
+            force_device,
+            Sam2Processor,
+            Sam2Model,
+            "image",
+        )
+
+    def _load_video_runtime(self, preferred_device: str, model_variant: str, *, force_device: str | None = None) -> None:
+        from transformers import Sam2VideoModel, Sam2VideoProcessor
+
+        self._load_runtime(
+            model_variant,
+            preferred_device,
+            force_device,
+            Sam2VideoProcessor,
+            Sam2VideoModel,
+            "video",
+        )
+
+    def _load_runtime(
+        self,
+        model_variant: str,
+        preferred_device: str,
+        force_device: str | None,
+        processor_cls,
+        model_cls,
+        mode: str,
+    ) -> None:
+        variant = _SAM2_VARIANTS.get(model_variant, _SAM2_VARIANTS[_DEFAULT_SAM2_VARIANT])
+        self._variant_key = model_variant if model_variant in _SAM2_VARIANTS else _DEFAULT_SAM2_VARIANT
+        self._variant_label = variant["label"]
+        device_order = [force_device] if force_device else self._preferred_devices(preferred_device)
+
+        last_error = None
+        for repo_id in variant["repos"]:
+            try:
+                processor = processor_cls.from_pretrained(repo_id)
+            except Exception as exc:
+                last_error = exc
+                continue
+
+            for device_name in device_order:
+                dtype = self._preferred_dtype(device_name)
+                model = None
+                try:
+                    model = model_cls.from_pretrained(repo_id, torch_dtype=dtype)
+                    model.eval()
+                    model.to(device_name)
+                    self._repo_id = repo_id
+                    self._device = device_name
+                    self._dtype = dtype
+                    if mode == "image":
+                        self._image_model = model
+                        self._image_processor = processor
+                    else:
+                        self._video_model = model
+                        self._video_processor = processor
+                    return
+                except Exception as exc:
+                    last_error = exc
+                    if model is not None:
+                        del model
+                    self._clear_device_cache(device_name)
+
+        raise RuntimeError(f"Unable to load the {self._variant_label} {mode} runtime: {last_error}")
+
+    def _move_inputs_to_device(self, inputs, *, pixel_dtype: torch.dtype) -> dict[str, torch.Tensor]:
+        model_inputs: dict[str, torch.Tensor] = {}
+        for key, value in inputs.items():
+            if not isinstance(value, torch.Tensor):
+                continue
+            if key == "pixel_values":
+                model_inputs[key] = value.to(self._device, dtype=pixel_dtype)
+            else:
+                model_inputs[key] = value.to(self._device)
+        return model_inputs
+
+    def _preferred_devices(self, preferred_device: str) -> list[str]:
+        device_order: list[str] = []
+        if preferred_device:
+            device_order.append(preferred_device)
         if torch.cuda.is_available() and "cuda" not in device_order:
             device_order.append("cuda")
         if hasattr(torch.backends, "mps") and torch.backends.mps.is_available() and "mps" not in device_order:
             device_order.append("mps")
         if "cpu" not in device_order:
             device_order.append("cpu")
+        return device_order
 
-        weights = MaskRCNN_ResNet50_FPN_Weights.DEFAULT
-        self._categories = list(weights.meta.get("categories", []))
+    @staticmethod
+    def _preferred_dtype(device_name: str) -> torch.dtype:
+        if device_name == "cuda":
+            return torch.bfloat16
+        if device_name == "mps":
+            return torch.float16
+        return torch.float32
 
-        last_error = None
-        for device_name in device_order:
-            try:
-                model = maskrcnn_resnet50_fpn(weights=weights)
-                model.eval()
-                model.to(device_name)
-                self._model = model
-                self._device = device_name
-                return
-            except Exception as exc:  # pragma: no cover - depends on local torch backend support
-                last_error = exc
+    @staticmethod
+    def _trim_processed_frames(session, frame_index: int, keep_frame_count: int) -> None:
+        processed_frames = getattr(session, "processed_frames", None)
+        if not isinstance(processed_frames, dict):
+            return
+        floor = max(0, frame_index - keep_frame_count)
+        for stale_index in list(processed_frames.keys()):
+            if stale_index not in (0, frame_index) and stale_index < floor:
+                processed_frames.pop(stale_index, None)
 
-        raise RuntimeError(f"Unable to load the segmentation model: {last_error}")
+    def _unload_image_runtime(self) -> None:
+        if self._image_model is not None:
+            del self._image_model
+            self._image_model = None
+        self._image_processor = None
+        self._clear_device_cache(self._device)
+
+    def _unload_video_runtime(self) -> None:
+        if self._video_model is not None:
+            del self._video_model
+            self._video_model = None
+        self._video_processor = None
+        self._clear_device_cache(self._device)
+
+    def _reset_runtime(self) -> None:
+        self._unload_image_runtime()
+        self._unload_video_runtime()
+        self._repo_id = None
+        self._variant_key = None
+        self._variant_label = "SAM2"
+        self._device = "cpu"
+        self._dtype = torch.float32
+
+    @staticmethod
+    def _clear_device_cache(device_name: str) -> None:
+        try:
+            from device_utils import clear_device_cache
+
+            clear_device_cache(device_name)
+        except Exception:
+            pass
+        gc.collect()
 
 
-class DetectObjectsWorker(QThread):
+class SegmentObjectWorker(QThread):
     status = Signal(str)
-    candidates_ready = Signal(object, str)
+    candidate_ready = Signal(object, str)
     failed = Signal(str)
 
     def __init__(
         self,
         frame_rgb: np.ndarray,
+        point_xy: tuple[int, int],
         manager: SegmentationModelManager,
         preferred_device: str,
-        score_threshold: float,
+        model_variant: str,
     ):
         super().__init__()
         self._frame_rgb = frame_rgb
+        self._point_xy = point_xy
         self._manager = manager
         self._preferred_device = preferred_device
-        self._score_threshold = score_threshold
+        self._model_variant = model_variant
 
     def run(self) -> None:
-        self.status.emit("Running instance segmentation on frame 0...")
+        self.status.emit("Segmenting the clicked object with SAM2...")
         try:
-            candidates, device_name = self._manager.detect_candidates(
+            candidate, device_name = self._manager.segment_point(
                 self._frame_rgb,
+                self._point_xy,
                 self._preferred_device,
-                self._score_threshold,
+                self._model_variant,
             )
-            self.candidates_ready.emit(candidates, device_name)
+            self.candidate_ready.emit(candidate, device_name)
         except Exception as exc:  # pragma: no cover - depends on local model/runtime
-            self.failed.emit(str(exc))
+            self.failed.emit(_format_exception_details("Segment object worker failed.", exc))
 
 
 class GenerateMaskHintWorker(QThread):
@@ -681,7 +945,7 @@ class GenerateMaskHintWorker(QThread):
         selections: list[SegmentationCandidate],
         manager: SegmentationModelManager,
         preferred_device: str,
-        score_threshold: float,
+        model_variant: str,
         blur_size: int,
         erode_size: int,
         batch_size: int,
@@ -692,7 +956,7 @@ class GenerateMaskHintWorker(QThread):
         self._selections = selections
         self._manager = manager
         self._preferred_device = preferred_device
-        self._score_threshold = score_threshold
+        self._model_variant = model_variant
         self._blur_size = blur_size
         self._erode_size = erode_size
         self._batch_size = max(1, batch_size)
@@ -702,138 +966,34 @@ class GenerateMaskHintWorker(QThread):
         self._cancel_requested.set()
 
     def run(self) -> None:
-        alpha_dir = os.path.join(self._clip_root, "AlphaHint")
-        cap = None
         try:
             self.status.emit(
-                f"Generating mask hints with Mask R-CNN in batches of {self._batch_size}. "
-                "Press Esc or use Cancel to stop after the current batch."
+                f"Generating mask hints with {self._model_variant} video propagation. "
+                f"Cache window: {self._batch_size} frames. Press Esc or use Cancel to stop."
             )
-            _clear_alpha_assets(self._clip_root)
-            os.makedirs(alpha_dir, exist_ok=True)
-
-            cap = cv2.VideoCapture(self._source_path)
-            if not cap.isOpened():
-                raise RuntimeError(f"Could not open source video: {self._source_path}")
-
-            total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-            trackers = []
-            previous_boxes = [selection.box for selection in self._selections]
-            for selection in self._selections:
-                tracker = _create_tracker()
-                trackers.append(tracker)
-
-            frame_index = 0
-            while True:
-                self._check_cancel(frame_index)
-
-                batch_bgr: list[np.ndarray] = []
-                batch_rgb: list[np.ndarray] = []
-                for _ in range(self._batch_size):
-                    ok, frame_bgr = cap.read()
-                    if not ok or frame_bgr is None:
-                        break
-                    batch_bgr.append(frame_bgr)
-                    batch_rgb.append(cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB))
-
-                if not batch_bgr:
-                    break
-
-                detect_offset = 1 if frame_index == 0 else 0
-                candidate_batches: list[list[SegmentationCandidate]] = []
-                if len(batch_rgb) > detect_offset:
-                    candidate_batches, _device_name = self._manager.detect_candidates_batch(
-                        batch_rgb[detect_offset:],
-                        self._preferred_device,
-                        self._score_threshold,
-                    )
-
-                candidate_iter = iter(candidate_batches)
-                for local_idx, (frame_bgr, frame_rgb) in enumerate(zip(batch_bgr, batch_rgb)):
-                    current_index = frame_index + local_idx
-                    self._check_cancel(current_index)
-
-                    if current_index == 0:
-                        chosen_masks = [selection.mask for selection in self._selections]
-                        for tracker, previous_box in zip(trackers, previous_boxes):
-                            if tracker is not None:
-                                tracker.init(frame_bgr, _xyxy_to_xywh(previous_box))
-                    else:
-                        remaining_candidates = list(next(candidate_iter, []))
-                        chosen_masks = []
-
-                        for idx, selection in enumerate(self._selections):
-                            tracked_box = None
-                            tracker = trackers[idx]
-                            if tracker is not None:
-                                tracker_ok, tracker_box = tracker.update(frame_bgr)
-                                if tracker_ok:
-                                    tracked_box = _xywh_to_xyxy(tracker_box)
-
-                            best = self._choose_candidate(
-                                selection,
-                                remaining_candidates,
-                                tracked_box or previous_boxes[idx],
-                            )
-
-                            if best is not None:
-                                chosen_masks.append(best.mask)
-                                previous_boxes[idx] = best.box
-                                if best in remaining_candidates:
-                                    remaining_candidates.remove(best)
-                                tracker = _create_tracker()
-                                trackers[idx] = tracker
-                                if tracker is not None:
-                                    tracker.init(frame_bgr, _xyxy_to_xywh(previous_boxes[idx]))
-                            elif tracked_box is not None:
-                                previous_boxes[idx] = _clip_box(tracked_box, frame_rgb.shape[1], frame_rgb.shape[0])
-                                chosen_masks.append(_rectangle_mask(frame_rgb.shape[:2], previous_boxes[idx]))
-                            else:
-                                chosen_masks.append(np.zeros(frame_rgb.shape[:2], dtype=np.float32))
-
-                    chosen_mask = np.zeros(frame_rgb.shape[:2], dtype=np.float32)
-                    for mask in chosen_masks:
-                        chosen_mask = np.maximum(chosen_mask, mask.astype(np.float32))
-
-                    hint = _coarse_hint_from_mask(chosen_mask, self._blur_size, self._erode_size)
-                    out_path = os.path.join(alpha_dir, f"frame_{current_index:06d}.png")
-                    cv2.imwrite(out_path, hint)
-                    self.progress.emit(current_index + 1, total_frames)
-                    self.preview.emit(current_index, frame_rgb, hint)
-
-                frame_index += len(batch_bgr)
-
-            if frame_index == 0:
-                raise RuntimeError("No frames were read from the source video")
-
+            alpha_dir, runtime_label = self._manager.generate_mask_hint(
+                source_path=self._source_path,
+                clip_root=self._clip_root,
+                selections=self._selections,
+                preferred_device=self._preferred_device,
+                model_variant=self._model_variant,
+                blur_size=self._blur_size,
+                erode_size=self._erode_size,
+                cache_size=self._batch_size,
+                cancel_event=self._cancel_requested,
+                on_frame=self._on_frame_processed,
+            )
+            self.status.emit(f"Mask hint generation finished with {runtime_label}.")
             self.completed.emit(alpha_dir)
         except JobCancelledError as exc:
             self.cancelled.emit(str(exc))
         except Exception as exc:  # pragma: no cover - depends on local model/runtime
-            self.failed.emit(str(exc))
-        finally:
-            if cap is not None:
-                cap.release()
+            self.failed.emit(_format_exception_details("Mask hint generation worker failed.", exc))
 
-    def _choose_candidate(
-        self,
-        selection: SegmentationCandidate,
-        candidates: list[SegmentationCandidate],
-        reference_box: tuple[int, int, int, int],
-    ) -> SegmentationCandidate | None:
-        filtered = [item for item in candidates if item.label_id == selection.label_id]
-        if not filtered:
-            filtered = candidates
-        if not filtered:
-            return None
-
-        scored: list[tuple[float, SegmentationCandidate]] = []
-        for candidate in filtered:
-            overlap = _box_iou(candidate.box, reference_box)
-            weighted_score = candidate.score + (overlap * 2.0)
-            scored.append((weighted_score, candidate))
-        scored.sort(key=lambda item: item[0], reverse=True)
-        return scored[0][1]
+    def _on_frame_processed(self, frame_index: int, total_frames: int, frame_rgb: np.ndarray, hint: np.ndarray) -> None:
+        self._check_cancel(frame_index)
+        self.progress.emit(frame_index + 1, total_frames)
+        self.preview.emit(frame_index, frame_rgb, hint)
 
     def _check_cancel(self, frame_index: int) -> None:
         if self._cancel_requested.is_set():
@@ -901,7 +1061,7 @@ class ExportWorker(QThread):
         except JobCancelledError as exc:
             self.cancelled.emit(str(exc))
         except Exception as exc:  # pragma: no cover - depends on local engine/runtime
-            self.failed.emit(str(exc))
+            self.failed.emit(_format_exception_details("Export worker failed.", exc))
 
 
 class CorridorKeyWindow(QMainWindow):
@@ -923,9 +1083,10 @@ class CorridorKeyWindow(QMainWindow):
         self.current_frame_index = 0
         self.candidates: list[SegmentationCandidate] = []
         self.selected_candidate_indices: set[int] = set()
-        self.detect_worker: DetectObjectsWorker | None = None
+        self.segment_worker: SegmentObjectWorker | None = None
         self.mask_worker: GenerateMaskHintWorker | None = None
         self.export_worker: ExportWorker | None = None
+        self._pending_click_shift = False
 
         self._build_ui()
         self._set_busy(False)
@@ -980,7 +1141,7 @@ class CorridorKeyWindow(QMainWindow):
         self.project_label = QLabel("No project loaded")
         self.project_label.setWordWrap(True)
         self.device_label = QLabel(f"Inference device: {self.device}")
-        self.segment_device_label = QLabel("Segmentation device: pending")
+        self.segment_device_label = QLabel("Segmentation backend: pending")
         self.project_label.setTextInteractionFlags(Qt.TextSelectableByMouse)
 
         inputs_layout.addWidget(QLabel("Video"), 0, 0)
@@ -995,13 +1156,11 @@ class CorridorKeyWindow(QMainWindow):
         inputs_layout.addWidget(self.segment_device_label, 4, 0, 1, 3)
         layout.addWidget(inputs_group)
 
-        segment_group = QGroupBox("Mask Generation")
+        segment_group = QGroupBox("Mask Hint Generation")
         segment_layout = QFormLayout(segment_group)
-        self.score_spin = QDoubleSpinBox()
-        self.score_spin.setRange(0.05, 0.99)
-        self.score_spin.setSingleStep(0.05)
-        self.score_spin.setDecimals(2)
-        self.score_spin.setValue(0.55)
+        self.sam2_model_combo = QComboBox()
+        self.sam2_model_combo.addItems(list(_SAM2_VARIANTS.keys()))
+        self.sam2_model_combo.setCurrentText(_DEFAULT_SAM2_VARIANT)
 
         self.blur_spin = QSpinBox()
         self.blur_spin.setRange(0, 99)
@@ -1012,15 +1171,15 @@ class CorridorKeyWindow(QMainWindow):
         self.erode_spin.setRange(0, 31)
         self.erode_spin.setValue(5)
 
-        self.detect_button = QPushButton("Detect Objects")
-        self.detect_button.clicked.connect(self._detect_objects)
+        self.clear_objects_button = QPushButton("Clear Objects")
+        self.clear_objects_button.clicked.connect(self._clear_segmented_objects)
         self.generate_button = QPushButton("Generate Mask Hint")
         self.generate_button.clicked.connect(self._generate_mask_hint)
 
-        segment_layout.addRow("Score threshold", self.score_spin)
+        segment_layout.addRow("SAM2 model", self.sam2_model_combo)
         segment_layout.addRow("Blur size", self.blur_spin)
         segment_layout.addRow("Erode size", self.erode_spin)
-        segment_layout.addRow(self.detect_button)
+        segment_layout.addRow(self.clear_objects_button)
         segment_layout.addRow(self.generate_button)
         layout.addWidget(segment_group)
 
@@ -1055,7 +1214,7 @@ class CorridorKeyWindow(QMainWindow):
         inference_layout.addRow(self.auto_despeckle_check)
         inference_layout.addRow("Despeckle size", self.despeckle_size_spin)
         inference_layout.addRow("Refiner scale", self.refiner_spin)
-        inference_layout.addRow("Batch size", self.batch_size_spin)
+        inference_layout.addRow("Batch / cache size", self.batch_size_spin)
         layout.addWidget(inference_group)
 
         export_group = QGroupBox("Export")
@@ -1082,7 +1241,9 @@ class CorridorKeyWindow(QMainWindow):
         export_layout.addRow(self.progress_label)
         layout.addWidget(export_group)
 
-        self.status_label = QLabel("Load a source video to begin. Hold Shift to multi-select objects. Press Esc to cancel long jobs.")
+        self.status_label = QLabel(
+            "Load a source video to begin. Click objects on frame 0, hold Shift to add/remove more, and press Esc to cancel long jobs."
+        )
         self.status_label.setWordWrap(True)
         layout.addWidget(self.status_label)
 
@@ -1192,7 +1353,8 @@ class CorridorKeyWindow(QMainWindow):
             self._configure_slider(self.source_reader.frame_count)
             self._update_previews()
             self._log(f"Loaded source video: {path}")
-            self._set_status("Source video loaded. Drop a mask hint or detect objects on frame 0.")
+            self.segment_device_label.setText("Segmentation backend: pending")
+            self._set_status("Source video loaded. Click objects on frame 0 or drop an existing mask hint.")
         except Exception as exc:
             self._show_error(str(exc))
             return
@@ -1219,14 +1381,23 @@ class CorridorKeyWindow(QMainWindow):
             self.selected_candidate_indices.clear()
             self._update_previews()
             self._log(f"Imported mask hint: {target}")
-            self._set_status("Mask hint loaded. Export is now available.")
+            self._set_status("Mask hint loaded. Export is now available. Click frame 0 if you want to replace it.")
         except Exception as exc:
             self._show_error(str(exc))
             return
 
         self._refresh_actions()
 
-    def _detect_objects(self) -> None:
+    def _clear_segmented_objects(self) -> None:
+        if self._is_busy():
+            return
+        self.candidates = []
+        self.selected_candidate_indices.clear()
+        self._update_previews()
+        self._set_status("Cleared the interactive SAM2 selection.")
+        self._refresh_actions()
+
+    def _segment_object_from_click(self, image_x: int, image_y: int, shift_held: bool) -> None:
         if self.source_reader is None:
             self._show_error("Load a source video first.")
             return
@@ -1241,36 +1412,60 @@ class CorridorKeyWindow(QMainWindow):
         self.frame_slider.setValue(0)
         self.frame_slider.blockSignals(False)
 
-        self.detect_worker = DetectObjectsWorker(
+        self._pending_click_shift = shift_held
+        self.segment_worker = SegmentObjectWorker(
             frame_rgb=frame_rgb,
+            point_xy=(image_x, image_y),
             manager=self.segmentation_manager,
             preferred_device=self.device,
-            score_threshold=self.score_spin.value(),
+            model_variant=self.sam2_model_combo.currentText(),
         )
-        self.detect_worker.status.connect(self._set_status)
-        self.detect_worker.candidates_ready.connect(self._on_candidates_ready)
-        self.detect_worker.failed.connect(self._show_error)
-        self.detect_worker.finished.connect(self._on_worker_finished)
-        self.detect_worker.start()
+        self.segment_worker.status.connect(self._set_status)
+        self.segment_worker.candidate_ready.connect(self._on_candidate_ready)
+        self.segment_worker.failed.connect(self._show_error)
+        self.segment_worker.finished.connect(self._on_worker_finished)
+        self.segment_worker.start()
         self._set_busy(True)
 
-    def _on_candidates_ready(self, candidates: list[SegmentationCandidate], device_name: str) -> None:
-        self.candidates = candidates
-        self.selected_candidate_indices.clear()
-        self.segment_device_label.setText(f"Segmentation device: {device_name}")
-        self._update_previews()
-        if candidates:
-            self._set_status("Click an object in the top preview. Hold Shift to add or remove more objects.")
-            self._log(f"Detected {len(candidates)} candidate objects on frame 0.")
+    def _on_candidate_ready(self, candidate: SegmentationCandidate, runtime_label: str) -> None:
+        self.segment_device_label.setText(f"Segmentation backend: {runtime_label}")
+        existing_index = None
+        for index, existing in enumerate(self.candidates):
+            if _mask_iou(existing.mask, candidate.mask) >= 0.85:
+                existing_index = index
+                break
+
+        if existing_index is None:
+            label_index = len(self.candidates)
+            prompt_point = candidate.prompt_point or (0, 0)
+            candidate = _make_candidate(candidate.mask, candidate.score, label_index, prompt_point)
+            self.candidates.append(candidate)
+            target_index = len(self.candidates) - 1
+            self._log(f"Added {candidate.label_name} with {runtime_label}.")
         else:
-            self._set_status("No candidate objects were found on frame 0.")
-            self._log("Segmentation model found no objects on frame 0.")
+            target_index = existing_index
+            candidate = self.candidates[target_index]
+
+        if self._pending_click_shift:
+            if target_index in self.selected_candidate_indices:
+                self.selected_candidate_indices.remove(target_index)
+            else:
+                self.selected_candidate_indices.add(target_index)
+        else:
+            self.selected_candidate_indices = {target_index}
+
+        self._update_previews()
+        selection_count = len(self.selected_candidate_indices)
+        if selection_count == 0:
+            self._set_status("Selection cleared.")
+        elif selection_count == 1:
+            self._set_status(f"Selected '{candidate.label_name}'. Hold Shift and click to add or remove more objects.")
+        else:
+            self._set_status(f"Selected {selection_count} objects. Generate the mask hint when ready.")
         self._refresh_actions()
 
     def _handle_video_click(self, image_x: int, image_y: int, shift_held: bool) -> None:
-        if self.current_frame_index != 0 or not self.candidates:
-            return
-        if self.source_reader is None:
+        if self.current_frame_index != 0 or self.source_reader is None or self._is_busy():
             return
 
         hit_index = None
@@ -1283,7 +1478,7 @@ class CorridorKeyWindow(QMainWindow):
                 break
 
         if hit_index is None:
-            self._set_status("That click did not land on a detected object.")
+            self._segment_object_from_click(image_x, image_y, shift_held)
             return
 
         if shift_held:
@@ -1314,17 +1509,27 @@ class CorridorKeyWindow(QMainWindow):
             self._show_error("Load a source video first.")
             return
         if not self.selected_candidate_indices:
-            self._show_error("Detect objects first, then click one or more objects.")
+            self._show_error("Click one or more objects on frame 0 first.")
             return
 
         selections = [self.candidates[index] for index in sorted(self.selected_candidate_indices)]
+        self._log(
+            "DEBUG mask hint request: "
+            f"clip_root={self.clip.root_path}, "
+            f"source={self.clip.input_asset.path}, "
+            f"objects={[candidate.label_name for candidate in selections]}, "
+            f"sam2_model={self.sam2_model_combo.currentText()}, "
+            f"blur={self.blur_spin.value()}, "
+            f"erode={self.erode_spin.value()}, "
+            f"cache={self.batch_size_spin.value()}"
+        )
         self.mask_worker = GenerateMaskHintWorker(
             source_path=self.clip.input_asset.path,
             clip_root=self.clip.root_path,
             selections=selections,
             manager=self.segmentation_manager,
             preferred_device=self.device,
-            score_threshold=self.score_spin.value(),
+            model_variant=self.sam2_model_combo.currentText(),
             blur_size=self.blur_spin.value(),
             erode_size=self.erode_spin.value(),
             batch_size=self.batch_size_spin.value(),
@@ -1373,6 +1578,19 @@ class CorridorKeyWindow(QMainWindow):
             refiner_scale=self.refiner_spin.value(),
         )
         output_config = _build_output_config(self.export_mode_combo.currentText())
+        self._log(
+            "DEBUG export request: "
+            f"clip_root={self.clip.root_path}, "
+            f"input={self.clip.input_asset.path if self.clip.input_asset else 'missing'}, "
+            f"alpha={self.clip.alpha_asset.path if self.clip.alpha_asset else 'missing'}, "
+            f"mode={self.export_mode_combo.currentText()}, "
+            f"batch_size={self.batch_size_spin.value()}, "
+            f"gamma={self.gamma_combo.currentText()}, "
+            f"despill={params.despill_strength}, "
+            f"auto_despeckle={params.auto_despeckle}, "
+            f"despeckle_size={params.despeckle_size}, "
+            f"refiner_scale={params.refiner_scale}"
+        )
 
         self.export_worker = ExportWorker(
             service=self.service,
@@ -1411,7 +1629,7 @@ class CorridorKeyWindow(QMainWindow):
 
     def _on_worker_finished(self) -> None:
         self._set_busy(False)
-        self.detect_worker = None
+        self.segment_worker = None
         self.mask_worker = None
         self.export_worker = None
         self._refresh_actions()
@@ -1447,28 +1665,29 @@ class CorridorKeyWindow(QMainWindow):
             else:
                 self.video_view.set_rgb_image(source_frame)
 
-        if self.alpha_reader is not None:
-            alpha_frame = self.alpha_reader.read_rgb(self.current_frame_index)
-            if alpha_frame is not None:
-                self.mask_view.set_rgb_image(alpha_frame)
-        elif self.selected_candidate_indices:
+        if self.current_frame_index == 0 and self.selected_candidate_indices:
             selected = [self.candidates[index] for index in sorted(self.selected_candidate_indices)]
             merged_mask = _merge_candidate_masks(selected)
             if merged_mask is not None:
                 self.mask_view.set_rgb_image(_mask_to_preview(_coarse_hint_from_mask(merged_mask, 0, 0)))
+        elif self.alpha_reader is not None:
+            alpha_frame = self.alpha_reader.read_rgb(self.current_frame_index)
+            if alpha_frame is not None:
+                self.mask_view.set_rgb_image(alpha_frame)
         else:
-            self.mask_view.set_placeholder("Mask Hint\nDrop a mask asset or generate one")
+            self.mask_view.set_placeholder("Mask Hint\nDrop a mask asset or click frame 0 to generate one")
 
         total = max(self.source_reader.frame_count, 1)
         self.frame_label.setText(f"Frame {self.current_frame_index + 1} / {total}")
 
     def _refresh_actions(self) -> None:
-        busy = self.detect_worker is not None or self.mask_worker is not None or self.export_worker is not None
+        busy = self.segment_worker is not None or self.mask_worker is not None or self.export_worker is not None
         has_source = self.clip is not None and self.source_reader is not None
+        has_segmented_objects = bool(self.candidates)
         has_selection = bool(self.selected_candidate_indices)
         has_alpha = self.clip is not None and self.clip.alpha_asset is not None
 
-        self.detect_button.setEnabled(has_source and not busy)
+        self.clear_objects_button.setEnabled(has_source and has_segmented_objects and not busy)
         self.generate_button.setEnabled(has_source and has_selection and not busy)
         self.export_button.setEnabled(has_source and has_alpha and not busy)
         self.cancel_button.setEnabled(self._has_cancelable_job())
@@ -1478,6 +1697,7 @@ class CorridorKeyWindow(QMainWindow):
         self.source_browse_button.setEnabled(not busy)
         self.alpha_browse_button.setEnabled(not busy)
         self.batch_size_spin.setEnabled(not busy)
+        self.sam2_model_combo.setEnabled(not busy)
 
     def _set_busy(self, busy: bool) -> None:
         if busy:
@@ -1505,8 +1725,16 @@ class CorridorKeyWindow(QMainWindow):
     def _show_error(self, message: str) -> None:
         self._set_busy(False)
         self._refresh_actions()
-        self._log(f"ERROR: {message}")
-        QMessageBox.critical(self, "CorridorKey Qt GUI", message)
+        if "Traceback (most recent call last):" in message:
+            self._log("ERROR TRACEBACK BEGIN")
+            for line in message.splitlines():
+                self._log(line)
+            self._log("ERROR TRACEBACK END")
+            dialog_message = _summarize_error_for_dialog(message)
+        else:
+            self._log(f"ERROR: {message}")
+            dialog_message = message
+        QMessageBox.critical(self, "CorridorKey Qt GUI", dialog_message)
 
     def _log(self, message: str) -> None:
         if not message:
@@ -1514,7 +1742,7 @@ class CorridorKeyWindow(QMainWindow):
         self.log_view.appendPlainText(message)
 
     def _is_busy(self) -> bool:
-        return self.detect_worker is not None or self.mask_worker is not None or self.export_worker is not None
+        return self.segment_worker is not None or self.mask_worker is not None or self.export_worker is not None
 
     def _has_cancelable_job(self) -> bool:
         return self.mask_worker is not None or self.export_worker is not None
@@ -1522,7 +1750,7 @@ class CorridorKeyWindow(QMainWindow):
     def _cancel_active_job(self) -> None:
         if self.mask_worker is not None:
             self.mask_worker.request_cancel()
-            self._set_status("Cancelling mask hint generation after the current batch...")
+            self._set_status("Cancelling mask hint generation...")
             return
         if self.export_worker is not None:
             self.export_worker.request_cancel()

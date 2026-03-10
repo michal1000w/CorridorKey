@@ -43,6 +43,19 @@ def _make_engine_with_mock(mock_greenformer, img_size=64):
     return engine
 
 
+class _DummyFusedAttentionModule(torch.nn.Module):
+    def __init__(self, fused_attn=True):
+        super().__init__()
+        self.fused_attn = fused_attn
+
+
+class _DummyAttentionContainer(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.attn_a = _DummyFusedAttentionModule(True)
+        self.attn_b = _DummyFusedAttentionModule(False)
+
+
 # ---------------------------------------------------------------------------
 # process_frame output structure
 # ---------------------------------------------------------------------------
@@ -97,6 +110,28 @@ class TestProcessFrameOutputs:
         assert fg.max() <= 1.01, f"fg max {fg.max():.4f} is above 1"
 
 
+class TestMpsAttentionFallback:
+    def test_disable_fused_attention_for_mps_turns_off_hiera_flags(self):
+        from CorridorKeyModule.inference_engine import _disable_fused_attention_for_mps
+
+        model = _DummyAttentionContainer()
+        disabled = _disable_fused_attention_for_mps(model, torch.device("mps"))
+
+        assert disabled == 1
+        assert model.attn_a.fused_attn is False
+        assert model.attn_b.fused_attn is False
+
+    def test_disable_fused_attention_for_mps_is_noop_on_cpu(self):
+        from CorridorKeyModule.inference_engine import _disable_fused_attention_for_mps
+
+        model = _DummyAttentionContainer()
+        disabled = _disable_fused_attention_for_mps(model, torch.device("cpu"))
+
+        assert disabled == 0
+        assert model.attn_a.fused_attn is True
+        assert model.attn_b.fused_attn is False
+
+
 # ---------------------------------------------------------------------------
 # process_batch behavior
 # ---------------------------------------------------------------------------
@@ -132,6 +167,19 @@ class TestProcessBatch:
             [sample_mask, sample_mask, sample_mask],
         )
         assert mock_greenformer.call_count == 1
+
+    def test_process_batch_passes_contiguous_tensor_to_model(self, sample_frame_rgb, sample_mask):
+        def fake_forward(x):
+            assert x.is_contiguous()
+            b, _c, h, w = x.shape
+            return {
+                "alpha": torch.full((b, 1, h, w), 0.8, device=x.device),
+                "fg": torch.full((b, 3, h, w), 0.6, device=x.device),
+            }
+
+        model = type("MockModel", (), {"__call__": staticmethod(fake_forward), "refiner": None, "use_refiner": False})()
+        engine = _make_engine_with_mock(model)
+        engine.process_batch([sample_frame_rgb, sample_frame_rgb], [sample_mask, sample_mask])
 
 
 # ---------------------------------------------------------------------------

@@ -62,9 +62,10 @@ def _auto_detect_backend() -> str:
         logger.info("corridorkey_mlx not installed — using torch backend")
         return "torch"
 
-    safetensor_files = glob.glob(os.path.join(CHECKPOINT_DIR, f"*{MLX_EXT}"))
-    if not safetensor_files:
-        logger.info("No %s checkpoint found — using torch backend", MLX_EXT)
+    try:
+        _discover_checkpoint(MLX_EXT)
+    except Exception as exc:
+        logger.info("MLX checkpoint unavailable (%s) — using torch backend", exc)
         return "torch"
 
     logger.info("Apple Silicon + MLX available — using mlx backend")

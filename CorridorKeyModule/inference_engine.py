@@ -15,6 +15,29 @@ from .core.model_transformer import GreenFormer
 logger = logging.getLogger(__name__)
 
 
+def _disable_fused_attention_for_mps(model: torch.nn.Module, device: torch.device) -> int:
+    """Disable fused SDPA in Hiera attention blocks on MPS.
+
+    Some Apple Silicon / MPS runs hit an internal view/stride error inside
+    torch.scaled_dot_product_attention() when timm's Hiera backbone uses the
+    fused attention path. Falling back to the explicit math path is slower,
+    but stable for export.
+    """
+    if device.type != "mps":
+        return 0
+
+    disabled = 0
+    for module in model.modules():
+        if hasattr(module, "fused_attn") and isinstance(getattr(module, "fused_attn"), bool):
+            if module.fused_attn:
+                module.fused_attn = False
+                disabled += 1
+
+    if disabled:
+        logger.info("Disabled fused SDPA on MPS for %d attention block(s)", disabled)
+    return disabled
+
+
 class CorridorKeyEngine:
     def __init__(
         self,
@@ -87,7 +110,7 @@ class CorridorKeyEngine:
                     grid_dst = int(math.sqrt(N_dst))
 
                     # Reshape to [1, C, H, W]
-                    v_img = v.permute(0, 2, 1).view(1, C, grid_src, grid_src)
+                    v_img = v.permute(0, 2, 1).reshape(1, C, grid_src, grid_src)
 
                     # Interpolate
                     v_resized = F.interpolate(v_img, size=(grid_dst, grid_dst), mode="bicubic", align_corners=False)
@@ -103,6 +126,7 @@ class CorridorKeyEngine:
         if len(unexpected) > 0:
             print(f"[Warning] Unexpected keys: {unexpected}")
 
+        _disable_fused_attention_for_mps(model, self.device)
         return model
 
     @torch.inference_mode()
@@ -153,7 +177,8 @@ class CorridorKeyEngine:
             batch_inputs.append(np.concatenate([img_norm, mask_resized], axis=-1))
 
         inp_np = np.stack(batch_inputs, axis=0)
-        inp_t = torch.from_numpy(inp_np.transpose((0, 3, 1, 2))).to(self.model_precision).to(self.device)
+        inp_nchw = np.ascontiguousarray(inp_np.transpose((0, 3, 1, 2)))
+        inp_t = torch.from_numpy(inp_nchw).to(self.model_precision).to(self.device).contiguous()
 
         handle = None
         if refiner_scale != 1.0 and self.model.refiner is not None:

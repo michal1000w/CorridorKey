@@ -48,19 +48,19 @@ class DecoderHead(nn.Module):
     def forward(self, features: list[torch.Tensor]) -> torch.Tensor:
         c1, c2, c3, c4 = features
 
-        n, _, h, w = c4.shape
+        n = c4.shape[0]
 
         # Resize to C1 size (which is H/4)
-        _c4 = self.linear_c4(c4.flatten(2).transpose(1, 2)).transpose(1, 2).view(n, -1, c4.shape[2], c4.shape[3])
+        _c4 = self.linear_c4(c4.flatten(2).transpose(1, 2)).transpose(1, 2).reshape(n, -1, c4.shape[2], c4.shape[3])
         _c4 = F.interpolate(_c4, size=c1.shape[2:], mode="bilinear", align_corners=False)
 
-        _c3 = self.linear_c3(c3.flatten(2).transpose(1, 2)).transpose(1, 2).view(n, -1, c3.shape[2], c3.shape[3])
+        _c3 = self.linear_c3(c3.flatten(2).transpose(1, 2)).transpose(1, 2).reshape(n, -1, c3.shape[2], c3.shape[3])
         _c3 = F.interpolate(_c3, size=c1.shape[2:], mode="bilinear", align_corners=False)
 
-        _c2 = self.linear_c2(c2.flatten(2).transpose(1, 2)).transpose(1, 2).view(n, -1, c2.shape[2], c2.shape[3])
+        _c2 = self.linear_c2(c2.flatten(2).transpose(1, 2)).transpose(1, 2).reshape(n, -1, c2.shape[2], c2.shape[3])
         _c2 = F.interpolate(_c2, size=c1.shape[2:], mode="bilinear", align_corners=False)
 
-        _c1 = self.linear_c1(c1.flatten(2).transpose(1, 2)).transpose(1, 2).view(n, -1, c1.shape[2], c1.shape[3])
+        _c1 = self.linear_c1(c1.flatten(2).transpose(1, 2)).transpose(1, 2).reshape(n, -1, c1.shape[2], c1.shape[3])
 
         _c = self.linear_fuse(torch.cat([_c4, _c3, _c2, _c1], dim=1))
         _c = self.bn(_c)

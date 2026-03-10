@@ -60,6 +60,55 @@ class TestResolveBackend:
             with mock.patch("builtins.__import__", side_effect=fail_mlx):
                 assert resolve_backend("auto") == "torch"
 
+    def test_auto_darwin_with_mlx_and_checkpoint_uses_mlx(self):
+        with (
+            mock.patch("CorridorKeyModule.backend.sys") as mock_sys,
+            mock.patch("CorridorKeyModule.backend.platform") as mock_platform,
+            mock.patch("CorridorKeyModule.backend._discover_checkpoint") as mock_discover,
+            mock.patch.dict(os.environ, {}, clear=True),
+        ):
+            mock_sys.platform = "darwin"
+            mock_platform.machine.return_value = "arm64"
+
+            import builtins
+
+            real_import = builtins.__import__
+
+            def import_mlx(name, *args, **kwargs):
+                if name == "corridorkey_mlx":
+                    return mock.Mock()
+                return real_import(name, *args, **kwargs)
+
+            with mock.patch("builtins.__import__", side_effect=import_mlx):
+                assert resolve_backend("auto") == "mlx"
+            mock_discover.assert_called_once_with(MLX_EXT)
+
+    def test_auto_darwin_with_mlx_but_no_checkpoint_falls_back_to_torch(self):
+        with (
+            mock.patch("CorridorKeyModule.backend.sys") as mock_sys,
+            mock.patch("CorridorKeyModule.backend.platform") as mock_platform,
+            mock.patch(
+                "CorridorKeyModule.backend._discover_checkpoint",
+                side_effect=FileNotFoundError("missing"),
+            ) as mock_discover,
+            mock.patch.dict(os.environ, {}, clear=True),
+        ):
+            mock_sys.platform = "darwin"
+            mock_platform.machine.return_value = "arm64"
+
+            import builtins
+
+            real_import = builtins.__import__
+
+            def import_mlx(name, *args, **kwargs):
+                if name == "corridorkey_mlx":
+                    return mock.Mock()
+                return real_import(name, *args, **kwargs)
+
+            with mock.patch("builtins.__import__", side_effect=import_mlx):
+                assert resolve_backend("auto") == "torch"
+            mock_discover.assert_called_once_with(MLX_EXT)
+
     def test_unknown_backend_raises(self):
         with pytest.raises(RuntimeError, match="Unknown backend"):
             resolve_backend("tensorrt")
