@@ -20,6 +20,15 @@ if ! command -v uv &> /dev/null; then
         fi
     fi
 fi
+
+# Detect Apple Silicon and install MLX version automatically
+if [ "$(uname -s)" = "Darwin" ] && [ "$(uname -m)" = "arm64" ]; then
+    echo "Apple Silicon detected. Ensuring MLX backend is installed..."
+    uv pip install "corridorkey-mlx@git+https://github.com/nikopueringer/corridorkey-mlx.git"
+    export CORRIDORKEY_BACKEND=mlx
+    export CORRIDORKEY_DEVICE=mps
+fi
+
 LOCAL_SCRIPT="$SCRIPT_DIR/corridorkey_cli.py"
 
 # SAFETY CHECK: Ensure a folder was provided as an argument

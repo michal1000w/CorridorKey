@@ -78,7 +78,7 @@ def _validate_mlx_available() -> None:
     except ImportError as err:
         raise RuntimeError(
             "MLX backend requested but corridorkey_mlx is not installed. "
-            "Install with: uv pip install corridorkey-mlx@git+https://github.com/cmoyates/corridorkey-mlx.git"
+            "Install with: uv pip install corridorkey-mlx@git+https://github.com/nikopueringer/corridorkey-mlx.git"
         ) from err
 
 
@@ -91,17 +91,28 @@ def _discover_checkpoint(ext: str) -> Path:
     matches = glob.glob(os.path.join(CHECKPOINT_DIR, f"*{ext}"))
 
     if len(matches) == 0:
-        logger.info(f"No {ext} checkpoint found in {CHECKPOINT_DIR}. Downloading from HuggingFace...")
-        try:
-            import huggingface_hub
-            huggingface_hub.snapshot_download(
-                repo_id="nikopueringer/CorridorKey_v1.0",
-                local_dir=CHECKPOINT_DIR,
-                allow_patterns=[f"*{ext}"]
-            )
-            matches = glob.glob(os.path.join(CHECKPOINT_DIR, f"*{ext}"))
-        except Exception as e:
-            logger.error(f"Failed to download {ext} checkpoints: {e}")
+        if ext == TORCH_EXT:
+            logger.info(f"No {ext} checkpoint found in {CHECKPOINT_DIR}. Downloading from HuggingFace...")
+            try:
+                import huggingface_hub
+                huggingface_hub.snapshot_download(
+                    repo_id="nikopueringer/CorridorKey_v1.0",
+                    local_dir=CHECKPOINT_DIR,
+                    allow_patterns=[f"*{ext}"]
+                )
+            except Exception as e:
+                logger.error(f"Failed to download {ext} checkpoints: {e}")
+        elif ext == MLX_EXT:
+            logger.info(f"No {ext} checkpoint found in {CHECKPOINT_DIR}. Downloading from GitHub Releases...")
+            try:
+                import urllib.request
+                url = "https://github.com/nikopueringer/corridorkey-mlx/releases/download/v1.0.0/corridorkey_mlx.safetensors"
+                dest = os.path.join(CHECKPOINT_DIR, "corridorkey_mlx.safetensors")
+                urllib.request.urlretrieve(url, dest)
+            except Exception as e:
+                logger.error(f"Failed to download {ext} checkpoint: {e}")
+        
+        matches = glob.glob(os.path.join(CHECKPOINT_DIR, f"*{ext}"))
 
     if len(matches) == 0:
         other_ext = MLX_EXT if ext == TORCH_EXT else TORCH_EXT
