@@ -239,6 +239,26 @@ class _MLXEngineAdapter:
         self._engine = raw_engine
         logger.info("MLX adapter active: despill and despeckle are handled by the adapter layer, not native MLX")
 
+    def unload(self) -> None:
+        """Release MLX model references and clear cached allocator state."""
+        raw_engine = self._engine
+        self._engine = None
+
+        try:
+            if raw_engine is not None and hasattr(raw_engine, "unload"):
+                raw_engine.unload()
+        except Exception as exc:
+            logger.debug("MLX engine unload warning: %s", exc)
+
+        gc.collect()
+
+        try:
+            import mlx.core as mx
+
+            mx.clear_cache()
+        except Exception as exc:
+            logger.debug("MLX cache clear warning: %s", exc)
+
     @staticmethod
     def _to_u8_image(image: np.ndarray) -> np.ndarray:
         if image.dtype != np.uint8:

@@ -41,7 +41,9 @@ def _project_venv_python() -> Path:
 
 
 def _missing_runtime_modules() -> list[str]:
-    required = ("PySide6", "cv2", "numpy", "torch", "transformers")
+    required = ["PySide6", "cv2", "numpy", "torch", "transformers"]
+    if sys.platform == "darwin" and platform.machine() == "arm64":
+        required.extend(["mlx", "corridorkey_mlx"])
     return [name for name in required if find_spec(name) is None]
 
 
@@ -1090,6 +1092,7 @@ class CorridorKeyWindow(QMainWindow):
 
         self._build_ui()
         self._set_busy(False)
+        self._refresh_runtime_label()
         self._refresh_actions()
 
     def closeEvent(self, event) -> None:  # noqa: N802 - Qt API
@@ -1140,7 +1143,7 @@ class CorridorKeyWindow(QMainWindow):
 
         self.project_label = QLabel("No project loaded")
         self.project_label.setWordWrap(True)
-        self.device_label = QLabel(f"Inference device: {self.device}")
+        self.device_label = QLabel(self._runtime_summary_text())
         self.segment_device_label = QLabel("Segmentation backend: pending")
         self.project_label.setTextInteractionFlags(Qt.TextSelectableByMouse)
 
@@ -1289,6 +1292,19 @@ class CorridorKeyWindow(QMainWindow):
         slider_row.addWidget(self.frame_label)
         layout.addLayout(slider_row)
         return panel
+
+    def _runtime_summary_text(self) -> str:
+        backend = self.service.inference_backend
+        if backend == "mlx":
+            backend_text = "MLX"
+        elif backend == "torch":
+            backend_text = "Torch"
+        else:
+            backend_text = "auto"
+        return f"Compute device: {self.device} | Inference backend: {backend_text}"
+
+    def _refresh_runtime_label(self) -> None:
+        self.device_label.setText(self._runtime_summary_text())
 
     def _browse_source(self) -> None:
         path, _selected = QFileDialog.getOpenFileName(
@@ -1629,6 +1645,7 @@ class CorridorKeyWindow(QMainWindow):
 
     def _on_worker_finished(self) -> None:
         self._set_busy(False)
+        self._refresh_runtime_label()
         self.segment_worker = None
         self.mask_worker = None
         self.export_worker = None

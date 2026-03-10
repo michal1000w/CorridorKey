@@ -13,7 +13,6 @@ Model Residency Policy:
 
 from __future__ import annotations
 
-import glob as glob_module
 import json
 import logging
 import os
@@ -160,6 +159,7 @@ class CorridorKeyService:
         self._videomama_pipeline = None
         self._active_model = _ActiveModel.NONE
         self._device: str = "cpu"
+        self._inference_backend: str = "auto"
         self._job_queue: GPUJobQueue | None = None
         # GPU mutex — serializes ALL model operations (Codex: thread safety)
         self._gpu_lock = threading.Lock()
@@ -170,6 +170,11 @@ class CorridorKeyService:
         if self._job_queue is None:
             self._job_queue = GPUJobQueue()
         return self._job_queue
+
+    @property
+    def inference_backend(self) -> str:
+        """Return the resolved inference backend, or ``auto`` before first load."""
+        return self._inference_backend
 
     # --- Device & Engine Management ---
 
@@ -290,44 +295,25 @@ class CorridorKeyService:
             return self._engine
 
         try:
-            from CorridorKeyModule.inference_engine import CorridorKeyEngine
+            from CorridorKeyModule.backend import create_engine, resolve_backend
         except ImportError as exc:
-            raise RuntimeError("CorridorKeyModule is not installed. Run: uv sync") from exc
+            raise RuntimeError("CorridorKeyModule backend is not installed. Run: uv sync") from exc
 
-        ckpt_dir = os.path.join(BASE_DIR, "CorridorKeyModule", "checkpoints")
-        ckpt_files = glob_module.glob(os.path.join(ckpt_dir, "*.pth"))
-
-        if len(ckpt_files) == 0:
-            logger.info(f"No checkpoint found in {ckpt_dir}. Downloading from HuggingFace...")
-            try:
-                import huggingface_hub
-
-                # The CorridorKey repo has a few checkpoints, we'll download all of them
-                # CorridorKey-v1.pth
-                huggingface_hub.snapshot_download(
-                    repo_id="CorridorDigital/CorridorKey", local_dir=ckpt_dir, allow_patterns=["*.pth"]
-                )
-                ckpt_files = glob_module.glob(os.path.join(ckpt_dir, "*.pth"))
-            except Exception as e:
-                logger.error(f"Failed to download checkpoints: {e}")
-
-        if len(ckpt_files) == 0:
-            raise FileNotFoundError(f"No .pth checkpoint found in {ckpt_dir}")
-        elif len(ckpt_files) > 1:
-            raise ValueError(
-                f"Multiple checkpoints found in {ckpt_dir}. "
-                f"Please ensure only one exists: {[os.path.basename(f) for f in ckpt_files]}"
-            )
-
-        ckpt_path = ckpt_files[0]
-        logger.info(f"Loading checkpoint: {os.path.basename(ckpt_path)}")
+        resolved_backend = resolve_backend()
+        logger.info("Loading CorridorKey inference backend: %s", resolved_backend)
         t0 = time.monotonic()
-        self._engine = CorridorKeyEngine(
-            checkpoint_path=ckpt_path,
+        self._engine = create_engine(
+            backend=resolved_backend,
             device=self._device,
             img_size=2048,
         )
-        logger.info(f"Engine loaded in {time.monotonic() - t0:.1f}s")
+        self._inference_backend = resolved_backend
+        logger.info(
+            "Inference engine loaded in %.1fs (%s backend, device=%s)",
+            time.monotonic() - t0,
+            self._inference_backend,
+            self._device,
+        )
         return self._engine
 
     def _get_gvm(self):

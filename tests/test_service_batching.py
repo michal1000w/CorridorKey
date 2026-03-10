@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 import numpy as np
 
@@ -50,3 +50,20 @@ def test_service_run_inference_uses_process_batch(tmp_clip_dir):
     assert len(args[0]) == 2
     assert len(args[1]) == 2
     assert kwargs["input_is_linear"] is False
+
+
+def test_service_get_engine_uses_backend_factory():
+    service = CorridorKeyService()
+    service._device = "mps"
+    mock_engine = MagicMock()
+
+    with (
+        patch("CorridorKeyModule.backend.resolve_backend", return_value="mlx") as mock_resolve_backend,
+        patch("CorridorKeyModule.backend.create_engine", return_value=mock_engine) as mock_create_engine,
+    ):
+        engine = service._get_engine()
+
+    assert engine is mock_engine
+    assert service.inference_backend == "mlx"
+    mock_resolve_backend.assert_called_once_with()
+    mock_create_engine.assert_called_once_with(backend="mlx", device="mps", img_size=2048)
