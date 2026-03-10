@@ -34,7 +34,7 @@ class TestResolveBackend:
             assert resolve_backend("auto") == "torch"
 
     def test_auto_non_darwin(self):
-        with mock.patch("CorridorKeyModule.backend.sys") as mock_sys:
+        with mock.patch("CorridorKeyModule.backend.sys") as mock_sys, mock.patch.dict(os.environ, {}, clear=True):
             mock_sys.platform = "linux"
             assert resolve_backend("auto") == "torch"
 
@@ -42,6 +42,7 @@ class TestResolveBackend:
         with (
             mock.patch("CorridorKeyModule.backend.sys") as mock_sys,
             mock.patch("CorridorKeyModule.backend.platform") as mock_platform,
+            mock.patch.dict(os.environ, {}, clear=True),
         ):
             mock_sys.platform = "darwin"
             mock_platform.machine.return_value = "arm64"
@@ -76,13 +77,19 @@ class TestDiscoverCheckpoint:
             assert result == ckpt
 
     def test_zero_raises(self, tmp_path):
-        with mock.patch("CorridorKeyModule.backend.CHECKPOINT_DIR", str(tmp_path)):
+        with (
+            mock.patch("CorridorKeyModule.backend.CHECKPOINT_DIR", str(tmp_path)),
+            mock.patch("huggingface_hub.snapshot_download"),
+        ):
             with pytest.raises(FileNotFoundError, match="No .pth checkpoint"):
                 _discover_checkpoint(TORCH_EXT)
 
     def test_zero_with_cross_reference(self, tmp_path):
         (tmp_path / "model.safetensors").touch()
-        with mock.patch("CorridorKeyModule.backend.CHECKPOINT_DIR", str(tmp_path)):
+        with (
+            mock.patch("CorridorKeyModule.backend.CHECKPOINT_DIR", str(tmp_path)),
+            mock.patch("huggingface_hub.snapshot_download"),
+        ):
             with pytest.raises(FileNotFoundError, match="--backend=mlx"):
                 _discover_checkpoint(TORCH_EXT)
 
