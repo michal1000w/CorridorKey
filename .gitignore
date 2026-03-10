@@ -1,5 +1,9 @@
 # Python
 __pycache__/
+.hf_cache/
+.uv_cache/
+.torch_cache/
+Projects/
 *.pyc
 *.pyo
 *.pyd
