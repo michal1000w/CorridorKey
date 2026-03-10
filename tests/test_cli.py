@@ -113,6 +113,7 @@ class TestCallbackProtocol:
         assert "on_frame_complete" in kwargs
         assert callable(kwargs["on_clip_start"])
         assert callable(kwargs["on_frame_complete"])
+        assert kwargs["batch_size"] == 1
 
     def test_callback_signatures(self):
         """Callbacks accept the documented (name, count) / (idx, total) args."""
@@ -231,6 +232,31 @@ class TestNonInteractiveFlags:
         settings = kwargs["settings"]
         assert settings.despill_strength == 1.0  # clamped 15→10, then /10
 
+    @patch("corridorkey_cli.scan_clips")
+    @patch("corridorkey_cli.run_inference")
+    def test_batch_size_flag_passed_through(self, mock_run, mock_scan):
+        """--batch-size is forwarded to the pipeline layer."""
+        mock_scan.return_value = []
+
+        result = runner.invoke(
+            app,
+            [
+                "run-inference",
+                "--batch-size",
+                "6",
+                "--srgb",
+                "--despill",
+                "5",
+                "--no-despeckle",
+                "--refiner",
+                "1.0",
+            ],
+        )
+        assert result.exit_code == 0
+
+        _, kwargs = mock_run.call_args
+        assert kwargs["batch_size"] == 6
+
     def test_run_inference_help_shows_flags(self):
         """run-inference --help lists the settings flags."""
         result = runner.invoke(app, ["run-inference", "--help"])
@@ -240,3 +266,4 @@ class TestNonInteractiveFlags:
         assert "--linear" in plain
         assert "--refiner" in plain
         assert "--despeckle-size" in plain
+        assert "--batch-size" in plain

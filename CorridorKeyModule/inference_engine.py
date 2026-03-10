@@ -106,6 +106,111 @@ class CorridorKeyEngine:
         return model
 
     @torch.inference_mode()
+    def process_batch(
+        self,
+        images: list[np.ndarray],
+        masks_linear: list[np.ndarray],
+        refiner_scale: float = 1.0,
+        input_is_linear: bool = False,
+        fg_is_straight: bool = True,
+        despill_strength: float = 1.0,
+        auto_despeckle: bool = True,
+        despeckle_size: int = 400,
+    ) -> list[dict[str, np.ndarray]]:
+        """Process a batch of frames with one model forward pass."""
+        if len(images) != len(masks_linear):
+            raise ValueError("images and masks_linear must have the same length")
+        if not images:
+            return []
+
+        batch_inputs: list[np.ndarray] = []
+        original_sizes: list[tuple[int, int]] = []
+
+        for image, mask_linear in zip(images, masks_linear):
+            if image.dtype == np.uint8:
+                image = image.astype(np.float32) / 255.0
+
+            if mask_linear.dtype == np.uint8:
+                mask_linear = mask_linear.astype(np.float32) / 255.0
+
+            h, w = image.shape[:2]
+            original_sizes.append((h, w))
+
+            if mask_linear.ndim == 2:
+                mask_linear = mask_linear[:, :, np.newaxis]
+
+            if input_is_linear:
+                img_resized_lin = cv2.resize(image, (self.img_size, self.img_size), interpolation=cv2.INTER_LINEAR)
+                img_resized = cu.linear_to_srgb(img_resized_lin)
+            else:
+                img_resized = cv2.resize(image, (self.img_size, self.img_size), interpolation=cv2.INTER_LINEAR)
+
+            mask_resized = cv2.resize(mask_linear, (self.img_size, self.img_size), interpolation=cv2.INTER_LINEAR)
+            if mask_resized.ndim == 2:
+                mask_resized = mask_resized[:, :, np.newaxis]
+
+            img_norm = (img_resized - self.mean) / self.std
+            batch_inputs.append(np.concatenate([img_norm, mask_resized], axis=-1))
+
+        inp_np = np.stack(batch_inputs, axis=0)
+        inp_t = torch.from_numpy(inp_np.transpose((0, 3, 1, 2))).to(self.model_precision).to(self.device)
+
+        handle = None
+        if refiner_scale != 1.0 and self.model.refiner is not None:
+
+            def scale_hook(module, input, output):
+                return output * refiner_scale
+
+            handle = self.model.refiner.register_forward_hook(scale_hook)
+
+        with torch.autocast(device_type=self.device.type, dtype=torch.float16, enabled=self.mixed_precision):
+            out = self.model(inp_t)
+
+        if handle:
+            handle.remove()
+
+        pred_alpha_batch = out["alpha"].permute(0, 2, 3, 1).float().cpu().numpy()
+        pred_fg_batch = out["fg"].permute(0, 2, 3, 1).float().cpu().numpy()
+
+        results: list[dict[str, np.ndarray]] = []
+        for (h, w), pred_alpha, pred_fg in zip(original_sizes, pred_alpha_batch, pred_fg_batch):
+            res_alpha = cv2.resize(pred_alpha, (w, h), interpolation=cv2.INTER_LANCZOS4)
+            res_fg = cv2.resize(pred_fg, (w, h), interpolation=cv2.INTER_LANCZOS4)
+
+            if res_alpha.ndim == 2:
+                res_alpha = res_alpha[:, :, np.newaxis]
+
+            if auto_despeckle:
+                processed_alpha = cu.clean_matte(res_alpha, area_threshold=despeckle_size, dilation=25, blur_size=5)
+            else:
+                processed_alpha = res_alpha
+
+            fg_despilled = cu.despill(res_fg, green_limit_mode="average", strength=despill_strength)
+            fg_despilled_lin = cu.srgb_to_linear(fg_despilled)
+            fg_premul_lin = cu.premultiply(fg_despilled_lin, processed_alpha)
+            processed_rgba = np.concatenate([fg_premul_lin, processed_alpha], axis=-1)
+
+            bg_srgb = cu.create_checkerboard(w, h, checker_size=128, color1=0.15, color2=0.55)
+            bg_lin = cu.srgb_to_linear(bg_srgb)
+
+            if fg_is_straight:
+                comp_lin = cu.composite_straight(fg_despilled_lin, bg_lin, processed_alpha)
+            else:
+                comp_lin = cu.composite_premul(fg_despilled_lin, bg_lin, processed_alpha)
+
+            comp_srgb = cu.linear_to_srgb(comp_lin)
+            results.append(
+                {
+                    "alpha": res_alpha,
+                    "fg": res_fg,
+                    "comp": comp_srgb,
+                    "processed": processed_rgba,
+                }
+            )
+
+        return results
+
+    @torch.inference_mode()
     def process_frame(
         self,
         image: np.ndarray,
@@ -135,112 +240,13 @@ class CorridorKeyEngine:
         Returns:
              dict: {'alpha': np, 'fg': np (sRGB), 'comp': np (sRGB on Gray)}
         """
-        # 1. Inputs Check & Normalization
-        if image.dtype == np.uint8:
-            image = image.astype(np.float32) / 255.0
-
-        if mask_linear.dtype == np.uint8:
-            mask_linear = mask_linear.astype(np.float32) / 255.0
-
-        h, w = image.shape[:2]
-
-        # Ensure Mask Shape
-        if mask_linear.ndim == 2:
-            mask_linear = mask_linear[:, :, np.newaxis]
-
-        # 2. Resize to Model Size
-        # If input is linear, we resize in linear to preserve energy/highlights,
-        # THEN convert to sRGB for the model.
-        if input_is_linear:
-            # Resize in Linear
-            img_resized_lin = cv2.resize(image, (self.img_size, self.img_size), interpolation=cv2.INTER_LINEAR)
-            # Convert to sRGB for Model
-            img_resized = cu.linear_to_srgb(img_resized_lin)
-        else:
-            # Standard sRGB Resize
-            img_resized = cv2.resize(image, (self.img_size, self.img_size), interpolation=cv2.INTER_LINEAR)
-
-        mask_resized = cv2.resize(mask_linear, (self.img_size, self.img_size), interpolation=cv2.INTER_LINEAR)
-
-        if mask_resized.ndim == 2:
-            mask_resized = mask_resized[:, :, np.newaxis]
-
-        # 3. Normalize (ImageNet)
-        # Model expects sRGB input normalized
-        img_norm = (img_resized - self.mean) / self.std
-
-        # 4. Prepare Tensor
-        inp_np = np.concatenate([img_norm, mask_resized], axis=-1)  # [H, W, 4]
-        inp_t = torch.from_numpy(inp_np.transpose((2, 0, 1))).unsqueeze(0).to(self.model_precision).to(self.device)
-
-        # 5. Inference
-        # Hook for Refiner Scaling
-        handle = None
-        if refiner_scale != 1.0 and self.model.refiner is not None:
-
-            def scale_hook(module, input, output):
-                return output * refiner_scale
-
-            handle = self.model.refiner.register_forward_hook(scale_hook)
-
-        with torch.autocast(device_type=self.device.type, dtype=torch.float16, enabled=self.mixed_precision):
-            out = self.model(inp_t)
-
-        if handle:
-            handle.remove()
-
-        pred_alpha = out["alpha"]
-        pred_fg = out["fg"]  # Output is sRGB (Sigmoid)
-
-        # 6. Post-Process (Resize Back to Original Resolution)
-        # We use Lanczos4 for high-quality resampling to minimize blur when going back to 4K/Original.
-        res_alpha = pred_alpha[0].permute(1, 2, 0).float().cpu().numpy()
-        res_fg = pred_fg[0].permute(1, 2, 0).float().cpu().numpy()
-        res_alpha = cv2.resize(res_alpha, (w, h), interpolation=cv2.INTER_LANCZOS4)
-        res_fg = cv2.resize(res_fg, (w, h), interpolation=cv2.INTER_LANCZOS4)
-
-        if res_alpha.ndim == 2:
-            res_alpha = res_alpha[:, :, np.newaxis]
-
-        # --- ADVANCED COMPOSITING ---
-
-        # A. Clean Matte (Auto-Despeckle)
-        if auto_despeckle:
-            processed_alpha = cu.clean_matte(res_alpha, area_threshold=despeckle_size, dilation=25, blur_size=5)
-        else:
-            processed_alpha = res_alpha
-
-        # B. Despill FG
-        # res_fg is sRGB.
-        fg_despilled = cu.despill(res_fg, green_limit_mode="average", strength=despill_strength)
-
-        # C. Premultiply (for EXR Output)
-        # CONVERT TO LINEAR FIRST! EXRs must house linear color premultiplied by linear alpha.
-        fg_despilled_lin = cu.srgb_to_linear(fg_despilled)
-        fg_premul_lin = cu.premultiply(fg_despilled_lin, processed_alpha)
-
-        # D. Pack RGBA
-        # [H, W, 4] - All channels are now strictly Linear Float
-        processed_rgba = np.concatenate([fg_premul_lin, processed_alpha], axis=-1)
-
-        # ----------------------------
-
-        # 7. Composite (on Checkerboard) for checking
-        # Generate Dark/Light Gray Checkerboard (in sRGB, convert to Linear)
-        bg_srgb = cu.create_checkerboard(w, h, checker_size=128, color1=0.15, color2=0.55)
-        bg_lin = cu.srgb_to_linear(bg_srgb)
-
-        if fg_is_straight:
-            comp_lin = cu.composite_straight(fg_despilled_lin, bg_lin, processed_alpha)
-        else:
-            # If premultiplied model, we shouldn't multiply again (though our pipeline forces straight)
-            comp_lin = cu.composite_premul(fg_despilled_lin, bg_lin, processed_alpha)
-
-        comp_srgb = cu.linear_to_srgb(comp_lin)
-
-        return {  # type: ignore[return-value]  # cu.* returns ndarray|Tensor but inputs are always ndarray here
-            "alpha": res_alpha,  # Linear, Raw Prediction
-            "fg": res_fg,  # sRGB, Raw Prediction (Straight)
-            "comp": comp_srgb,  # sRGB, Composite
-            "processed": processed_rgba,  # Linear/Premul, RGBA, Garbage Matted & Despilled
-        }
+        return self.process_batch(
+            [image],
+            [mask_linear],
+            refiner_scale=refiner_scale,
+            input_is_linear=input_is_linear,
+            fg_is_straight=fg_is_straight,
+            despill_strength=despill_strength,
+            auto_despeckle=auto_despeckle,
+            despeckle_size=despeckle_size,
+        )[0]

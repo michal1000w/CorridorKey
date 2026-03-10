@@ -55,7 +55,16 @@ TARGET_PATH="${TARGET_PATH%/}"
 echo "Starting Corridor Key locally..."
 echo "Target: $TARGET_PATH"
 
+read -r -p "Inference batch size [8]: " BATCH_SIZE
+BATCH_SIZE="${BATCH_SIZE:-8}"
+
+if ! [[ "$BATCH_SIZE" =~ ^[1-9][0-9]*$ ]]; then
+    echo "[ERROR] Batch size must be a positive integer."
+    read -p "Press enter to exit..."
+    exit 1
+fi
+
 # Run via uv entry point (handles the virtual environment automatically)
-uv run corridorkey wizard "$TARGET_PATH"
+uv run corridorkey wizard --batch-size "$BATCH_SIZE" "$TARGET_PATH"
 
 read -p "Press enter to close..."

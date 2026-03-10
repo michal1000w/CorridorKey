@@ -56,7 +56,7 @@ class TestE2EInferenceWorkflow:
         monkeypatch.setattr("builtins.input", lambda prompt="": "")
 
         mock_engine = MagicMock()
-        mock_engine.process_frame.return_value = _fake_result()
+        mock_engine.process_batch.side_effect = lambda images, masks, **kwargs: [_fake_result() for _ in images]
 
         with patch("CorridorKeyModule.backend.create_engine", return_value=mock_engine):
             run_inference([entry], device="cpu")
@@ -81,7 +81,7 @@ class TestE2EInferenceWorkflow:
         monkeypatch.setattr("builtins.input", lambda prompt="": "")
 
         mock_engine = MagicMock()
-        mock_engine.process_frame.return_value = _fake_result()
+        mock_engine.process_batch.side_effect = lambda images, masks, **kwargs: [_fake_result() for _ in images]
 
         with patch("CorridorKeyModule.backend.create_engine", return_value=mock_engine):
             run_inference([entry], device="cpu")
@@ -108,11 +108,31 @@ class TestE2EInferenceWorkflow:
         monkeypatch.setattr("builtins.input", lambda prompt="": "")
 
         mock_engine = MagicMock()
-        mock_engine.process_frame.return_value = _fake_result()
+        mock_engine.process_batch.side_effect = lambda images, masks, **kwargs: [_fake_result() for _ in images]
 
         with patch("CorridorKeyModule.backend.create_engine", return_value=mock_engine):
             run_inference([entry], device="cpu")
 
         # No engine calls — clip was filtered out before inference
-        mock_engine.process_frame.assert_not_called()
+        mock_engine.process_batch.assert_not_called()
         assert not (tmp_clip_dir / "shot_b" / "Output").exists()
+
+    def test_batch_size_chunks_engine_calls(self, tmp_clip_dir, monkeypatch):
+        """run_inference forwards the requested batch size to the engine."""
+        from clip_manager import ClipEntry, run_inference
+
+        entry = ClipEntry("shot_a", str(tmp_clip_dir / "shot_a"))
+        entry.find_assets()
+
+        monkeypatch.setattr("builtins.input", lambda prompt="": "")
+
+        mock_engine = MagicMock()
+        mock_engine.process_batch.side_effect = lambda images, masks, **kwargs: [_fake_result() for _ in images]
+
+        with patch("CorridorKeyModule.backend.create_engine", return_value=mock_engine):
+            run_inference([entry], device="cpu", batch_size=2)
+
+        mock_engine.process_batch.assert_called_once()
+        args, _ = mock_engine.process_batch.call_args
+        assert len(args[0]) == 2
+        assert len(args[1]) == 2

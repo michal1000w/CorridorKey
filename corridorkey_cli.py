@@ -267,6 +267,10 @@ def run_inference_cmd(
         Optional[float],
         typer.Option("--refiner", help="Refiner strength multiplier (default: prompt)"),
     ] = None,
+    batch_size: Annotated[
+        int,
+        typer.Option("--batch-size", min=1, help="Frames per inference batch"),
+    ] = 1,
 ) -> None:
     """Run CorridorKey inference on clips with Input + AlphaHint.
 
@@ -302,6 +306,7 @@ def run_inference_cmd(
             device=ctx.obj["device"],
             backend=backend,
             max_frames=max_frames,
+            batch_size=batch_size,
             settings=settings,
             on_clip_start=ctx_progress.on_clip_start,
             on_frame_complete=ctx_progress.on_frame_complete,
@@ -314,9 +319,13 @@ def run_inference_cmd(
 def wizard(
     ctx: typer.Context,
     path: Annotated[str, typer.Argument(help="Target path (Windows or local)")],
+    batch_size: Annotated[
+        int,
+        typer.Option("--batch-size", min=1, help="Frames per inference batch"),
+    ] = 1,
 ) -> None:
     """Interactive wizard for organizing clips and running the pipeline."""
-    interactive_wizard(path, device=ctx.obj["device"])
+    interactive_wizard(path, device=ctx.obj["device"], batch_size=batch_size)
 
 
 # ---------------------------------------------------------------------------
@@ -324,7 +333,7 @@ def wizard(
 # ---------------------------------------------------------------------------
 
 
-def interactive_wizard(win_path: str, device: str | None = None) -> None:
+def interactive_wizard(win_path: str, device: str | None = None, batch_size: int = 1) -> None:
     console.print(Panel("[bold]CORRIDOR KEY — SMART WIZARD[/bold]", style="cyan"))
 
     # 1. Resolve Path
@@ -509,12 +518,14 @@ def interactive_wizard(win_path: str, device: str | None = None) -> None:
 
         elif choice == "i":
             console.print(Panel("Corridor Key Inference", style="magenta"))
+            console.print(f"Using batch size: [bold]{batch_size}[/bold]")
             try:
                 settings = _prompt_inference_settings()
                 with ProgressContext() as ctx_progress:
                     run_inference(
                         ready,
                         device=device,
+                        batch_size=batch_size,
                         settings=settings,
                         on_clip_start=ctx_progress.on_clip_start,
                         on_frame_complete=ctx_progress.on_frame_complete,

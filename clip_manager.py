@@ -556,6 +556,7 @@ def run_inference(
     device=None,
     backend=None,
     max_frames=None,
+    batch_size: int = 1,
     settings: InferenceSettings | None = None,
     *,
     on_clip_start: Callable[[str, int], None] | None = None,
@@ -577,13 +578,89 @@ def run_inference(
     if not os.path.exists(OUTPUT_DIR):
         os.makedirs(OUTPUT_DIR, exist_ok=True)
 
-    import numpy as np
-
     if device is None:
         device = resolve_device()
     from CorridorKeyModule.backend import create_engine
 
     engine = create_engine(backend=backend, device=device)
+    batch_size = max(1, int(batch_size))
+
+    def _read_input_frame(clip_entry: ClipEntry, frame_index: int, capture, files: list[str]) -> tuple[np.ndarray, str] | None:
+        input_stem = f"{frame_index:05d}"
+
+        if capture is not None:
+            ret, frame = capture.read()
+            if not ret:
+                return None
+            img_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            return img_rgb.astype(np.float32) / 255.0, input_stem
+
+        fpath = os.path.join(clip_entry.input_asset.path, files[frame_index])
+        input_stem = os.path.splitext(files[frame_index])[0]
+
+        if fpath.lower().endswith(".exr"):
+            img_linear = cv2.imread(fpath, cv2.IMREAD_UNCHANGED)
+            if img_linear is None:
+                return None
+            img_linear_rgb = cv2.cvtColor(img_linear, cv2.COLOR_BGR2RGB)
+            return np.maximum(img_linear_rgb, 0.0), input_stem
+
+        img_bgr = cv2.imread(fpath)
+        if img_bgr is None:
+            return None
+        img_rgb = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
+        return img_rgb.astype(np.float32) / 255.0, input_stem
+
+    def _read_alpha_frame(clip_entry: ClipEntry, frame_index: int, capture, files: list[str], target_shape) -> np.ndarray | None:
+        if capture is not None:
+            ret, frame = capture.read()
+            if not ret:
+                return None
+            mask_linear = frame[:, :, 2].astype(np.float32) / 255.0
+        else:
+            fpath = os.path.join(clip_entry.alpha_asset.path, files[frame_index])
+            mask_in = cv2.imread(fpath, cv2.IMREAD_ANYDEPTH | cv2.IMREAD_UNCHANGED)
+            if mask_in is None:
+                return None
+
+            if mask_in.ndim == 3:
+                if mask_in.shape[2] == 3:
+                    mask_linear = mask_in[:, :, 0]
+                else:
+                    mask_linear = mask_in
+            else:
+                mask_linear = mask_in
+
+            if mask_linear.dtype == np.uint8:
+                mask_linear = mask_linear.astype(np.float32) / 255.0
+            elif mask_linear.dtype == np.uint16:
+                mask_linear = mask_linear.astype(np.float32) / 65535.0
+            else:
+                mask_linear = mask_linear.astype(np.float32)
+
+        if mask_linear.shape[:2] != target_shape:
+            mask_linear = cv2.resize(mask_linear, (target_shape[1], target_shape[0]), interpolation=cv2.INTER_LINEAR)
+
+        return mask_linear
+
+    def _save_inference_result(result: dict[str, np.ndarray], input_stem: str, fg_dir, matte_dir, comp_dir, proc_dir) -> None:
+        pred_fg = result["fg"]
+        fg_bgr = cv2.cvtColor(pred_fg, cv2.COLOR_RGB2BGR)
+        cv2.imwrite(os.path.join(fg_dir, f"{input_stem}.exr"), fg_bgr, EXR_WRITE_FLAGS)
+
+        pred_alpha = result["alpha"]
+        if pred_alpha.ndim == 3:
+            pred_alpha = pred_alpha[:, :, 0]
+        cv2.imwrite(os.path.join(matte_dir, f"{input_stem}.exr"), pred_alpha, EXR_WRITE_FLAGS)
+
+        comp_srgb = result["comp"]
+        comp_bgr = cv2.cvtColor((np.clip(comp_srgb, 0.0, 1.0) * 255.0).astype(np.uint8), cv2.COLOR_RGB2BGR)
+        cv2.imwrite(os.path.join(comp_dir, f"{input_stem}.png"), comp_bgr)
+
+        if "processed" in result:
+            proc_rgba = result["processed"]
+            proc_bgra = cv2.cvtColor(proc_rgba, cv2.COLOR_RGBA2BGRA)
+            cv2.imwrite(os.path.join(proc_dir, f"{input_stem}.exr"), proc_bgra, EXR_WRITE_FLAGS)
 
     for clip in ready_clips:
         logger.info(f"Running Inference on: {clip.name}")
@@ -605,6 +682,7 @@ def run_inference(
             f"  Input frames: {clip.input_asset.frame_count},"
             f" Alpha frames: {clip.alpha_asset.frame_count} -> Processing {num_frames} frames"
         )
+        logger.info(f"  Batch size: {batch_size}")
 
         if num_frames == 0:
             logger.warning(f"Clip '{clip.name}': 0 frames to process, skipping.")
@@ -628,119 +706,80 @@ def run_inference(
         if on_clip_start:
             on_clip_start(clip.name, num_frames)
 
-        for i in range(num_frames):
-            # 1. Read Input
-            img_srgb = None
-            input_stem = f"{i:05d}"
+        frame_index = 0
+        input_is_linear = settings.input_is_linear
+        use_straight_model = True
 
-            # Use the settings-defined gamma
-            input_is_linear = settings.input_is_linear
+        while frame_index < num_frames:
+            batch_images: list[np.ndarray] = []
+            batch_masks: list[np.ndarray] = []
+            batch_stems: list[str] = []
+            batch_frame_indices: list[int] = []
+            requested_batch = min(batch_size, num_frames - frame_index)
+            hit_stream_end = False
 
-            if input_cap:
-                ret, frame = input_cap.read()
-                if not ret:
+            for batch_offset in range(requested_batch):
+                current_index = frame_index + batch_offset
+                input_frame = _read_input_frame(clip, current_index, input_cap, input_files)
+                if input_frame is None:
+                    hit_stream_end = True
                     break
-                img_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-                img_srgb = img_rgb.astype(np.float32) / 255.0
-                input_stem = f"{i:05d}"
-            else:
-                fpath = os.path.join(clip.input_asset.path, input_files[i])
-                input_stem = os.path.splitext(input_files[i])[0]
 
-                is_exr = fpath.lower().endswith(".exr")
-                if is_exr:
-                    img_linear = cv2.imread(fpath, cv2.IMREAD_UNCHANGED)
-                    if img_linear is None:
-                        continue
-                    img_linear_rgb = cv2.cvtColor(img_linear, cv2.COLOR_BGR2RGB)
-                    # Support overriding EXR behavior if user picked 's'
-                    img_srgb = np.maximum(img_linear_rgb, 0.0)
-                else:
-                    img_bgr = cv2.imread(fpath)
-                    if img_bgr is None:
-                        continue
-                    img_rgb = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
-                    img_srgb = img_rgb.astype(np.float32) / 255.0
-
-            # 2. Read Alpha (Mask)
-            mask_linear = None
-            if alpha_cap:
-                ret, frame = alpha_cap.read()
-                if not ret:
+                img_srgb, input_stem = input_frame
+                mask_linear = _read_alpha_frame(clip, current_index, alpha_cap, alpha_files, img_srgb.shape[:2])
+                if mask_linear is None:
+                    hit_stream_end = True
                     break
-                mask_linear = frame[:, :, 2].astype(np.float32) / 255.0
+
+                batch_images.append(img_srgb)
+                batch_masks.append(mask_linear)
+                batch_stems.append(input_stem)
+                batch_frame_indices.append(current_index)
+
+            if not batch_images:
+                break
+
+            process_batch = getattr(engine, "process_batch", None)
+            if callable(process_batch):
+                batch_results = process_batch(
+                    batch_images,
+                    batch_masks,
+                    input_is_linear=input_is_linear,
+                    fg_is_straight=use_straight_model,
+                    despill_strength=settings.despill_strength,
+                    auto_despeckle=settings.auto_despeckle,
+                    despeckle_size=settings.despeckle_size,
+                    refiner_scale=settings.refiner_scale,
+                )
             else:
-                fpath = os.path.join(clip.alpha_asset.path, alpha_files[i])
-                mask_in = cv2.imread(fpath, cv2.IMREAD_ANYDEPTH | cv2.IMREAD_UNCHANGED)
+                batch_results = [
+                    engine.process_frame(
+                        image,
+                        mask,
+                        input_is_linear=input_is_linear,
+                        fg_is_straight=use_straight_model,
+                        despill_strength=settings.despill_strength,
+                        auto_despeckle=settings.auto_despeckle,
+                        despeckle_size=settings.despeckle_size,
+                        refiner_scale=settings.refiner_scale,
+                    )
+                    for image, mask in zip(batch_images, batch_masks)
+                ]
 
-                if mask_in is None:
-                    continue
-
-                if mask_in.ndim == 3:
-                    if mask_in.shape[2] == 3:
-                        mask_linear = mask_in[:, :, 0]
-                    else:
-                        mask_linear = mask_in
-                else:
-                    mask_linear = mask_in
-
-                if mask_linear.dtype == np.uint8:
-                    mask_linear = mask_linear.astype(np.float32) / 255.0
-                elif mask_linear.dtype == np.uint16:
-                    mask_linear = mask_linear.astype(np.float32) / 65535.0
-                else:
-                    mask_linear = mask_linear.astype(np.float32)
-
-            if mask_linear.shape[:2] != img_srgb.shape[:2]:
-                mask_linear = cv2.resize(
-                    mask_linear, (img_srgb.shape[1], img_srgb.shape[0]), interpolation=cv2.INTER_LINEAR
+            if len(batch_results) != len(batch_images):
+                raise RuntimeError(
+                    f"Engine returned {len(batch_results)} results for a batch of {len(batch_images)} frames"
                 )
 
-            # 3. Process
-            USE_STRAIGHT_MODEL = True
-            res = engine.process_frame(
-                img_srgb,
-                mask_linear,
-                input_is_linear=input_is_linear,
-                fg_is_straight=USE_STRAIGHT_MODEL,
-                despill_strength=settings.despill_strength,
-                auto_despeckle=settings.auto_despeckle,
-                despeckle_size=settings.despeckle_size,
-                refiner_scale=settings.refiner_scale,
-            )
+            for current_index, input_stem, result in zip(batch_frame_indices, batch_stems, batch_results):
+                _save_inference_result(result, input_stem, fg_dir, matte_dir, comp_dir, proc_dir)
+                if on_frame_complete:
+                    on_frame_complete(current_index, num_frames)
 
-            pred_fg = res["fg"]  # sRGB
-            pred_alpha = res["alpha"]  # Linear
+            frame_index += len(batch_images)
 
-            # 4. Save (EXR half-float, PXR24 compression — see backend/frame_io.py)
-
-            # Save FG
-            # pred_fg is RGB 0-1 float. Convert to BGR for OpenCV
-            fg_bgr = cv2.cvtColor(pred_fg, cv2.COLOR_RGB2BGR)
-            cv2.imwrite(os.path.join(fg_dir, f"{input_stem}.exr"), fg_bgr, EXR_WRITE_FLAGS)
-
-            # Save Matte
-            if pred_alpha.ndim == 3:
-                pred_alpha = pred_alpha[:, :, 0]
-            # Matte is single channel linear float
-            cv2.imwrite(os.path.join(matte_dir, f"{input_stem}.exr"), pred_alpha, EXR_WRITE_FLAGS)
-
-            # 5. Generate Reference Comp
-            comp_srgb = res["comp"]
-            # Save Comp (PNG 8-bit)
-            comp_bgr = cv2.cvtColor((np.clip(comp_srgb, 0.0, 1.0) * 255.0).astype(np.uint8), cv2.COLOR_RGB2BGR)
-            cv2.imwrite(os.path.join(comp_dir, f"{input_stem}.png"), comp_bgr)
-
-            # 6. Save Processed (RGBA EXR)
-            if "processed" in res:
-                # Result is RGBA
-                proc_rgba = res["processed"]
-                # Convert to BGRA for OpenCV
-                proc_bgra = cv2.cvtColor(proc_rgba, cv2.COLOR_RGBA2BGRA)
-                cv2.imwrite(os.path.join(proc_dir, f"{input_stem}.exr"), proc_bgra, EXR_WRITE_FLAGS)
-
-            if on_frame_complete:
-                on_frame_complete(i, num_frames)
+            if hit_stream_end:
+                break
 
         if input_cap:
             input_cap.release()
@@ -916,6 +955,12 @@ if __name__ == "__main__":
         default=None,
         help="Limit number of frames to process per clip (e.g. 1 for first frame only)",
     )
+    parser.add_argument(
+        "--batch-size",
+        type=int,
+        default=1,
+        help="Number of frames to process in one inference batch",
+    )
 
     args = parser.parse_args()
 
@@ -929,7 +974,13 @@ if __name__ == "__main__":
         generate_alphas(clips, device=device)
     elif args.action == "run_inference":
         clips = scan_clips()
-        run_inference(clips, device=device, backend=args.backend, max_frames=args.max_frames)
+        run_inference(
+            clips,
+            device=device,
+            backend=args.backend,
+            max_frames=args.max_frames,
+            batch_size=args.batch_size,
+        )
     elif args.action == "wizard":
         if not args.win_path:
             print("Error: --win_path required for wizard.")

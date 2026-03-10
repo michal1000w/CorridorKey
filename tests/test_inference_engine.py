@@ -98,6 +98,43 @@ class TestProcessFrameOutputs:
 
 
 # ---------------------------------------------------------------------------
+# process_batch behavior
+# ---------------------------------------------------------------------------
+
+
+class TestProcessBatch:
+    """Verify batched inference uses a single model forward and preserves shapes."""
+
+    def test_process_batch_returns_one_result_per_input(self, sample_frame_rgb, sample_mask, mock_greenformer):
+        engine = _make_engine_with_mock(mock_greenformer)
+        batch = engine.process_batch([sample_frame_rgb, sample_frame_rgb], [sample_mask, sample_mask])
+
+        assert len(batch) == 2
+        assert batch[0]["alpha"].shape[:2] == sample_frame_rgb.shape[:2]
+        assert batch[1]["processed"].shape == (*sample_frame_rgb.shape[:2], 4)
+
+    def test_process_batch_supports_mixed_original_sizes(self, sample_mask, mock_greenformer):
+        engine = _make_engine_with_mock(mock_greenformer)
+        img_a = np.random.default_rng(1).random((32, 48, 3), dtype=np.float32)
+        img_b = np.random.default_rng(2).random((40, 24, 3), dtype=np.float32)
+        mask_a = np.ones((32, 48), dtype=np.float32)
+        mask_b = np.ones((40, 24), dtype=np.float32)
+
+        batch = engine.process_batch([img_a, img_b], [mask_a, mask_b])
+
+        assert batch[0]["alpha"].shape[:2] == img_a.shape[:2]
+        assert batch[1]["fg"].shape[:2] == img_b.shape[:2]
+
+    def test_process_batch_calls_model_once(self, sample_frame_rgb, sample_mask, mock_greenformer):
+        engine = _make_engine_with_mock(mock_greenformer)
+        engine.process_batch(
+            [sample_frame_rgb, sample_frame_rgb, sample_frame_rgb],
+            [sample_mask, sample_mask, sample_mask],
+        )
+        assert mock_greenformer.call_count == 1
+
+
+# ---------------------------------------------------------------------------
 # Input color space handling
 # ---------------------------------------------------------------------------
 
